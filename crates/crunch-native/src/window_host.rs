@@ -11,9 +11,8 @@ use crate::keys::scan_code;
 
 const WIDTH: usize = 640;
 const HEIGHT: usize = 480;
-const MOUSE_GAIN: f32 = 2.0;
 
-// Desktop shell with a scaled window, relative mouse deltas and the audio queue
+// Desktop shell with a scaled window, the window mouse as the pointer and the audio queue
 pub struct WindowHost {
     window: Window,
     files: Files,
@@ -22,7 +21,6 @@ pub struct WindowHost {
     start: Instant,
     last_audio: Instant,
     rgb: Vec<u32>,
-    last_mouse: Option<(f32, f32)>,
     debug_toggle: bool,
     quit_requested: bool,
 }
@@ -45,7 +43,6 @@ impl WindowHost {
             start: Instant::now(),
             last_audio: Instant::now(),
             rgb: vec![0; WIDTH * HEIGHT * scale * scale],
-            last_mouse: None,
             debug_toggle: false,
             quit_requested: false,
         })
@@ -116,13 +113,8 @@ impl Host for WindowHost {
         if self.window.is_key_pressed(Key::F1, KeyRepeat::No) {
             self.debug_toggle = true;
         }
-        if let Some((x, y)) = self.window.get_mouse_pos(MouseMode::Pass) {
-            let (x, y) = (x / self.scale as f32, y / self.scale as f32);
-            if let Some((px, py)) = self.last_mouse {
-                state.mouse_dx = ((x - px) * MOUSE_GAIN).round() as i32;
-                state.mouse_dy = ((y - py) * MOUSE_GAIN).round() as i32;
-            }
-            self.last_mouse = Some((x, y));
+        if let Some((x, y)) = self.window.get_mouse_pos(MouseMode::Clamp) {
+            state.pointer = Some(((x / self.scale as f32) as i16, (y / self.scale as f32) as i16));
         }
         state.buttons = [
             self.window.get_mouse_down(MouseButton::Left),

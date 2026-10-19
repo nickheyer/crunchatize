@@ -41,12 +41,13 @@ const KEY_NAMES: [&str; 0x68] = [
     "PGUP", "LEFT", "RIGHT", "END", "DOWN", "PGDN", "INS", "DEL", "LWIN", "RWIN", "APPS",
 ];
 
-// Raw device state the host samples once per tick
+// Raw device state the host samples once per tick, pointer set by hosts that know the absolute mouse spot
 #[derive(Clone, Debug)]
 pub struct DeviceState {
     pub scan_keys: [bool; 256],
     pub mouse_dx: i32,
     pub mouse_dy: i32,
+    pub pointer: Option<(i16, i16)>,
     pub buttons: [bool; 3],
 }
 
@@ -58,7 +59,7 @@ impl Default for DeviceState {
 
 impl DeviceState {
     pub fn new() -> Self {
-        Self { scan_keys: [false; 256], mouse_dx: 0, mouse_dy: 0, buttons: [false; 3] }
+        Self { scan_keys: [false; 256], mouse_dx: 0, mouse_dy: 0, pointer: None, buttons: [false; 3] }
     }
 }
 
@@ -76,8 +77,8 @@ impl Input {
         Self { keys: [[0; 256]; 2], buttons: [0; 3], current: 0, mouse: [0; 2], sensitivity }
     }
 
-    // Flips the key snapshot pair and samples the devices for this tick
-    pub fn heartbeat(&mut self, device: &DeviceState) {
+    // Flips the key snapshot pair and samples the devices, a pointer becoming the delta from the cursor onto it
+    pub fn heartbeat(&mut self, device: &DeviceState, cursor: (i16, i16)) {
         self.current ^= 1;
         let cur = &mut self.keys[self.current];
         for (dst, &down) in cur.iter_mut().zip(device.scan_keys.iter()) {
@@ -89,8 +90,13 @@ impl Input {
                 self.buttons[i] |= 0x80;
             }
         }
-        let s = self.sensitivity as f64;
-        self.mouse = [ftol(device.mouse_dx as f64 * s) as i16, ftol(device.mouse_dy as f64 * s) as i16];
+        self.mouse = match device.pointer {
+            Some((px, py)) => [px.saturating_sub(cursor.0), py.saturating_sub(cursor.1)],
+            None => {
+                let s = self.sensitivity as f64;
+                [ftol(device.mouse_dx as f64 * s) as i16, ftol(device.mouse_dy as f64 * s) as i16]
+            }
+        };
     }
 
     fn scan_for(code: i32) -> Option<usize> {
@@ -153,9 +159,9 @@ mod tests {
         let mut input = Input::new(0.5);
         let mut dev = DeviceState::new();
         dev.scan_keys[0x39] = true;
-        input.heartbeat(&dev);
+        input.heartbeat(&dev, (0, 0));
         assert_eq!(input.key_input(), 0x39);
-        input.heartbeat(&dev);
+        input.heartbeat(&dev, (0, 0));
         assert_eq!(input.key_input(), 0);
         assert!(input.is_key_down(0x39));
     }
@@ -164,7 +170,15 @@ mod tests {
     fn mouse_delta_is_scaled_and_truncated() {
         let mut input = Input::new(0.5);
         let dev = DeviceState { mouse_dx: 7, mouse_dy: -3, ..DeviceState::new() };
-        input.heartbeat(&dev);
+        input.heartbeat(&dev, (0, 0));
         assert_eq!(input.mouse_delta(), (3, -1));
+    }
+
+    #[test]
+    fn pointer_overrides_the_delta_with_the_move_onto_it() {
+        let mut input = Input::new(0.5);
+        let dev = DeviceState { pointer: Some((100, 40)), mouse_dx: 7, ..DeviceState::new() };
+        input.heartbeat(&dev, (60, 50));
+        assert_eq!(input.mouse_delta(), (40, -10));
     }
 }

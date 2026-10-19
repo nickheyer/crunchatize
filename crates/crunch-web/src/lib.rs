@@ -9,29 +9,32 @@ use std::rc::Rc;
 use avmanager::input::DeviceState;
 use avmanager::sound::Sound;
 use crunch::host::Host;
+use crunch_pak::Index;
 use js_sys::{Array, Float32Array, Function, Promise, Reflect, Uint8Array};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
-    AudioContext, AudioContextOptions, AudioContextState, AudioWorkletNode, AudioWorkletNodeOptions,
-    CanvasRenderingContext2d, HtmlCanvasElement, ImageData, KeyboardEvent, MouseEvent, Response, Window,
+    AudioContext, AudioContextOptions, AudioContextState, AudioWorkletNode, AudioWorkletNodeOptions, Cache,
+    CanvasRenderingContext2d, HtmlCanvasElement, ImageData, KeyboardEvent, PointerEvent, ReadableStreamDefaultReader,
+    ReadableStreamReadResult, Request, Response, Url, Window,
 };
 
 const WIDTH: u32 = 640;
 const HEIGHT: u32 = 480;
-const MOUSE_GAIN: f64 = 2.0;
 const SAVE_PREFIX: &str = "crunch.save.";
 const OUT_RATE: u32 = 48000;
 const TARGET_BUFFER_SECONDS: f64 = 0.12;
 const MAX_CATCH_UP_SECONDS: f64 = 1.0;
 const GESTURE_EVENTS: [&str; 4] = ["pointerdown", "pointerup", "keydown", "touchend"];
+const PACK: &str = "crunch.pak";
+const CACHE_NAME: &str = "crunch";
+const BAR_WIDTH: f64 = 400.0;
 
 // Input gathered by browser event listeners between game ticks
 #[derive(Default)]
 struct InputState {
     keys: HashMap<usize, bool>,
-    dx: f64,
-    dy: f64,
+    pointer: Option<(i16, i16)>,
     buttons: [bool; 3],
     debug_toggle: bool,
 }
@@ -44,9 +47,30 @@ struct AudioOut {
 
 type SharedAudio = Rc<RefCell<Option<AudioOut>>>;
 
+// The whole data pack held in memory with its parsed index
+struct Pack {
+    bytes: Vec<u8>,
+    index: Index,
+}
+
+impl Pack {
+    fn parse(bytes: Vec<u8>) -> Result<Self, JsValue> {
+        let index = crunch_pak::read_index(&mut bytes.as_slice()).map_err(|e| JsValue::from(e.to_string()))?;
+        Ok(Self { bytes, index })
+    }
+
+    // Bytes of one file by lower case name, None when the pack has no such file
+    fn file(&self, name: &str) -> Option<&[u8]> {
+        let entry = self.index.files.get(name)?;
+        let start = usize::try_from(self.index.body_start + entry.offset).ok()?;
+        let end = start.checked_add(usize::try_from(entry.size).ok()?)?;
+        self.bytes.get(start..end)
+    }
+}
+
 // Browser shell drawing to a canvas, mixing audio into a worklet, and saving to local storage
 pub struct WebHost {
-    base_url: String,
+    pack: Pack,
     canvas: HtmlCanvasElement,
     ctx2d: CanvasRenderingContext2d,
     rgba: Vec<u8>,
@@ -147,10 +171,7 @@ async fn fetch_text(window: &Window, url: &str) -> Result<String, JsValue> {
 impl Host for WebHost {
     async fn read_file(&mut self, name: &str) -> Option<Vec<u8>> {
         let file = name.rsplit(['\\', '/']).next().unwrap_or(name).to_lowercase();
-        let url = format!("{}{}", self.base_url, file);
-        let response = fetch_ok(&web_sys::window()?, &url).await.ok()?;
-        let buffer = JsFuture::from(response.array_buffer().ok()?).await.ok()?;
-        Some(Uint8Array::new(&buffer).to_vec())
+        self.pack.file(&file).map(<[u8]>::to_vec)
     }
 
     fn time_ms(&self) -> u32 {
@@ -162,17 +183,14 @@ impl Host for WebHost {
     }
 
     fn poll_input(&mut self) -> DeviceState {
-        let mut input = self.input.borrow_mut();
+        let input = self.input.borrow();
         let mut state = DeviceState::new();
         for (&code, &down) in &input.keys {
             if down && code < 256 {
                 state.scan_keys[code] = true;
             }
         }
-        state.mouse_dx = input.dx.round() as i32;
-        state.mouse_dy = input.dy.round() as i32;
-        input.dx = 0.0;
-        input.dy = 0.0;
+        state.pointer = input.pointer;
         state.buttons = input.buttons;
         state
     }
@@ -257,6 +275,129 @@ fn decode_hex(text: &str) -> Option<Vec<u8>> {
     (0..text.len()).step_by(2).map(|i| u8::from_str_radix(&text[i..i + 2], 16).ok()).collect()
 }
 
+// Paints a caption and a progress bar on the black canvas while the pack loads
+fn draw_progress(ctx2d: &CanvasRenderingContext2d, caption: &str, fraction: f64) {
+    let (w, h) = (f64::from(WIDTH), f64::from(HEIGHT));
+    let left = (w - BAR_WIDTH) / 2.0;
+    ctx2d.set_fill_style_str("#000");
+    ctx2d.fill_rect(0.0, 0.0, w, h);
+    ctx2d.set_fill_style_str("#ddd");
+    ctx2d.set_stroke_style_str("#ddd");
+    ctx2d.set_font("16px sans-serif");
+    ctx2d.set_text_align("center");
+    let _ = ctx2d.fill_text(caption, w / 2.0, h / 2.0 - 12.0);
+    ctx2d.fill_rect(left, h / 2.0, BAR_WIDTH * fraction, 10.0);
+    ctx2d.stroke_rect(left + 0.5, h / 2.0 + 0.5, BAR_WIDTH, 10.0);
+}
+
+// Message text of a thrown value, the string itself or an Error's message
+fn describe(e: &JsValue) -> String {
+    e.as_string()
+        .or_else(|| e.dyn_ref::<js_sys::Error>().map(|err| String::from(err.message())))
+        .unwrap_or_else(|| format!("{e:?}"))
+}
+
+// Opens the cache that keeps the pack between visits, None with a console warning where the browser has none
+async fn open_cache(window: &Window) -> Option<Cache> {
+    let opened: Result<Cache, JsValue> = async {
+        let caches = window.caches()?;
+        JsFuture::from(caches.open(CACHE_NAME)).await?.dyn_into()
+    }
+    .await;
+    match opened {
+        Ok(cache) => Some(cache),
+        Err(e) => {
+            web_sys::console::warn_1(&e);
+            None
+        }
+    }
+}
+
+// Deletes every cached pack except the one at the given address
+async fn prune_cache(cache: &Cache, keep: &str) -> Result<(), JsValue> {
+    let keys: Array = JsFuture::from(cache.keys()).await?.dyn_into()?;
+    for key in keys.iter() {
+        let request: Request = key.dyn_into()?;
+        if request.url() != keep {
+            JsFuture::from(cache.delete_with_request(&request)).await?;
+        }
+    }
+    Ok(())
+}
+
+// Downloads the pack and stores a copy in the cache while the download streams on to the caller
+async fn fetch_and_keep(window: &Window, cache: Option<&Cache>, url: &str) -> Result<Response, JsValue> {
+    let response = fetch_ok(window, url).await?;
+    let Some(cache) = cache else { return Ok(response) };
+    if let Err(e) = prune_cache(cache, url).await {
+        web_sys::console::warn_1(&e);
+    }
+    let copy = response.clone()?;
+    let cache = cache.clone();
+    let key = url.to_string();
+    spawn_local(async move {
+        if let Err(e) = JsFuture::from(cache.put_with_str(&key, &copy)).await {
+            web_sys::console::warn_1(&e);
+        }
+    });
+    Ok(response)
+}
+
+// Streams a response body into memory, reporting bytes received and the total at every whole percent
+async fn read_body(response: &Response, mut progress: impl FnMut(usize, usize)) -> Result<Vec<u8>, JsValue> {
+    let total: usize = response
+        .headers()
+        .get("content-length")?
+        .and_then(|v| v.parse().ok())
+        .ok_or("pack response has no content-length")?;
+    let body = response.body().ok_or("pack response has no body")?;
+    let reader: ReadableStreamDefaultReader = body.get_reader().unchecked_into();
+    let mut bytes = Vec::with_capacity(total);
+    let mut shown = usize::MAX;
+    loop {
+        let result: ReadableStreamReadResult = JsFuture::from(reader.read()).await?.unchecked_into();
+        if result.get_done().unwrap_or(false) {
+            break;
+        }
+        let chunk: Uint8Array = result.get_value().dyn_into()?;
+        let start = bytes.len();
+        bytes.resize(start + chunk.length() as usize, 0);
+        chunk.copy_to(&mut bytes[start..]);
+        let percent = (bytes.len() as f64 * 100.0 / total.max(1) as f64) as usize;
+        if percent != shown {
+            shown = percent;
+            progress(bytes.len(), total);
+        }
+    }
+    if bytes.len() != total {
+        return Err(format!("pack is {} bytes but {total} were announced", bytes.len()).into());
+    }
+    Ok(bytes)
+}
+
+// Finds the current pack version and brings that pack into memory from the cache or the network
+async fn load_pack(window: &Window, ctx2d: &CanvasRenderingContext2d, data_url: &str) -> Result<Pack, JsValue> {
+    draw_progress(ctx2d, "Checking game data", 0.0);
+    let version = fetch_text(window, &format!("{data_url}version")).await?;
+    let url = Url::new_with_base(&format!("{data_url}{}/{PACK}", version.trim()), &window.location().href()?)?.href();
+    let cache = open_cache(window).await;
+    let cached = match &cache {
+        Some(c) => JsFuture::from(c.match_with_str(&url)).await?.dyn_into::<Response>().ok(),
+        None => None,
+    };
+    let (response, verb) = match cached {
+        Some(r) => (r, "Loading"),
+        None => (fetch_and_keep(window, cache.as_ref(), &url).await?, "Downloading"),
+    };
+    let bytes = read_body(&response, |done, total| {
+        let fraction = done as f64 / total as f64;
+        let caption = format!("{verb} game data {:.0}% of {:.0} MB", fraction * 100.0, total as f64 / 1e6);
+        draw_progress(ctx2d, &caption, fraction);
+    })
+    .await?;
+    Pack::parse(bytes)
+}
+
 // True when the page already holds a user activation or the browser reports audio may start without one
 fn autoplay_allowed(window: &Window) -> bool {
     let navigator = window.navigator();
@@ -325,7 +466,20 @@ fn attach_audio_unlock(window: &Window, shared: SharedAudio, worklet_url: String
     unlock.forget();
 }
 
-// Installs keyboard and mouse listeners on the canvas that accumulate into the shared state
+// Pointer position in game pixels clamped to the screen, from an event anywhere on the page
+fn pointer_at(canvas: &HtmlCanvasElement, e: &PointerEvent) -> (i16, i16) {
+    let rect = canvas.get_bounding_client_rect();
+    let x = (f64::from(e.client_x()) - rect.left()) * f64::from(WIDTH) / rect.width().max(1.0);
+    let y = (f64::from(e.client_y()) - rect.top()) * f64::from(HEIGHT) / rect.height().max(1.0);
+    (x.floor().clamp(0.0, f64::from(WIDTH - 1)) as i16, y.floor().clamp(0.0, f64::from(HEIGHT - 1)) as i16)
+}
+
+// Game button slot for a browser button, left then right then middle
+fn button_slot(e: &PointerEvent) -> Option<usize> {
+    [0usize, 2, 1].get(usize::try_from(e.button()).ok()?).copied()
+}
+
+// Installs keyboard and pointer listeners that accumulate into the shared state
 fn attach_input(canvas: &HtmlCanvasElement, input: Rc<RefCell<InputState>>) {
     let down = input.clone();
     let on_key_down = Closure::<dyn FnMut(KeyboardEvent)>::new(move |e: KeyboardEvent| {
@@ -348,37 +502,32 @@ fn attach_input(canvas: &HtmlCanvasElement, input: Rc<RefCell<InputState>>) {
         }
     });
     let moved = input.clone();
-    let scale_canvas = canvas.clone();
-    let on_move = Closure::<dyn FnMut(MouseEvent)>::new(move |e: MouseEvent| {
-        let rect_w = scale_canvas.client_width().max(1) as f64;
-        let scale = WIDTH as f64 / rect_w;
-        let mut s = moved.borrow_mut();
-        s.dx += e.movement_x() as f64 * scale * MOUSE_GAIN;
-        s.dy += e.movement_y() as f64 * scale * MOUSE_GAIN;
+    let move_canvas = canvas.clone();
+    let on_move = Closure::<dyn FnMut(PointerEvent)>::new(move |e: PointerEvent| {
+        moved.borrow_mut().pointer = Some(pointer_at(&move_canvas, &e));
     });
     let pressed = input.clone();
-    let on_down = Closure::<dyn FnMut(MouseEvent)>::new(move |e: MouseEvent| {
-        let b = e.button() as usize;
-        if b < 3 {
-            let idx = [0usize, 2, 1][b];
-            pressed.borrow_mut().buttons[idx] = true;
+    let press_canvas = canvas.clone();
+    let on_down = Closure::<dyn FnMut(PointerEvent)>::new(move |e: PointerEvent| {
+        let mut s = pressed.borrow_mut();
+        s.pointer = Some(pointer_at(&press_canvas, &e));
+        if let Some(slot) = button_slot(&e) {
+            s.buttons[slot] = true;
         }
         e.prevent_default();
     });
     let released = input.clone();
-    let on_up = Closure::<dyn FnMut(MouseEvent)>::new(move |e: MouseEvent| {
-        let b = e.button() as usize;
-        if b < 3 {
-            let idx = [0usize, 2, 1][b];
-            released.borrow_mut().buttons[idx] = false;
+    let on_up = Closure::<dyn FnMut(PointerEvent)>::new(move |e: PointerEvent| {
+        if let Some(slot) = button_slot(&e) {
+            released.borrow_mut().buttons[slot] = false;
         }
     });
     let window = web_sys::window().expect("window");
     let _ = window.add_event_listener_with_callback("keydown", on_key_down.as_ref().unchecked_ref());
     let _ = window.add_event_listener_with_callback("keyup", on_key_up.as_ref().unchecked_ref());
-    let _ = canvas.add_event_listener_with_callback("mousemove", on_move.as_ref().unchecked_ref());
-    let _ = canvas.add_event_listener_with_callback("mousedown", on_down.as_ref().unchecked_ref());
-    let _ = window.add_event_listener_with_callback("mouseup", on_up.as_ref().unchecked_ref());
+    let _ = window.add_event_listener_with_callback("pointermove", on_move.as_ref().unchecked_ref());
+    let _ = canvas.add_event_listener_with_callback("pointerdown", on_down.as_ref().unchecked_ref());
+    let _ = window.add_event_listener_with_callback("pointerup", on_up.as_ref().unchecked_ref());
     on_key_down.forget();
     on_key_up.forget();
     on_move.forget();
@@ -386,7 +535,7 @@ fn attach_input(canvas: &HtmlCanvasElement, input: Rc<RefCell<InputState>>) {
     on_up.forget();
 }
 
-// Boots the game on a canvas, reading files from the pack version the data URL currently serves
+// Boots the game on a canvas after loading the pack version the data URL currently serves
 #[wasm_bindgen]
 pub async fn start(canvas: HtmlCanvasElement, data_url: String, worklet_url: String) -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
@@ -402,11 +551,17 @@ pub async fn start(canvas: HtmlCanvasElement, data_url: String, worklet_url: Str
         open_audio(&audio, &worklet_url)?;
     }
     attach_audio_unlock(&window, audio.clone(), worklet_url);
-    let version = fetch_text(&window, &format!("{data_url}version")).await?;
+    let pack = match load_pack(&window, &ctx2d, &data_url).await {
+        Ok(pack) => pack,
+        Err(e) => {
+            draw_progress(&ctx2d, &format!("Could not load game data, {}", describe(&e)), 0.0);
+            return Err(e);
+        }
+    };
     let input = Rc::new(RefCell::new(InputState::default()));
     attach_input(&canvas, input.clone());
     let host = WebHost {
-        base_url: format!("{data_url}{}/", version.trim()),
+        pack,
         canvas: canvas.clone(),
         ctx2d,
         rgba: vec![0; (WIDTH * HEIGHT * 4) as usize],

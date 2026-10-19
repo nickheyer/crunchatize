@@ -18,23 +18,8 @@ pub const TICK_INTERVAL_MS: i32 = 0x20;
 const LOADING_X: i32 = 0x10c;
 const LOADING_Y: i32 = 0xd6;
 
-const HAIR_TABLE: [[u8; 3]; 6] = [
-    [0x00, 0x00, 0xff],
-    [0xe0, 0x00, 0x78],
-    [0xff, 0x00, 0x00],
-    [0x20, 0x6c, 0x38],
-    [0x80, 0x04, 0xd8],
-    [0x70, 0x28, 0x00],
-];
-
-const FLESH_TABLE: [[u8; 3]; 6] = [
-    [0x10, 0x90, 0xf8],
-    [0xf8, 0x94, 0xc8],
-    [0xf8, 0x94, 0x20],
-    [0x20, 0xe8, 0x20],
-    [0xc0, 0x80, 0xf8],
-    [0xf8, 0xc8, 0x30],
-];
+// Opened when the player picks Go Online, the source and credits for this port
+pub const ONLINE_URL: &str = "https://github.com/nickheyer/crunchatize";
 
 // One of the nine concrete screens, dispatched by game state id
 pub enum ScreenBox {
@@ -171,27 +156,6 @@ impl Game {
     }
 }
 
-// Index of a colour in a six entry table, 6 when absent
-fn color_index(table: &[[u8; 3]; 6], rgb: [u8; 3]) -> usize {
-    table.iter().position(|&c| c == rgb).unwrap_or(6)
-}
-
-// The connect.php address opened when the player chose to go online
-pub fn online_url<H: Host>(ctx: &Ctx<H>) -> String {
-    let p = &ctx.player;
-    format!(
-        "http://www.capncrunch.com/games_online/connect.php?name={}&stage={}&hair={}&flesh={}&type={}&strength={}&jumping={}&running={}",
-        p.name_str(),
-        p.stage,
-        color_index(&HAIR_TABLE, p.hair),
-        color_index(&FLESH_TABLE, p.flesh),
-        p.kind,
-        p.strength,
-        p.jumping,
-        p.running
-    )
-}
-
 // Draws the F1 statistics overlay the original rendered with GDI text
 fn draw_debug_overlay<H: Host>(ctx: &mut Ctx<H>, delta_ms: i32) {
     let fps = if delta_ms != 0 { 1000 / delta_ms } else { 0 };
@@ -222,7 +186,7 @@ pub async fn run<H: Host>(host: H, out_rate: u32) -> H {
             if ctx.host.take_debug_toggle() {
                 ctx.globals.debug_overlay = !ctx.globals.debug_overlay;
             }
-            ctx.av.input.heartbeat(&device);
+            ctx.av.input.heartbeat(&device, (ctx.cursor.x, ctx.cursor.y));
             ctx.av.sound.heartbeat();
             if !game.tick(&mut ctx).await {
                 break;
@@ -245,8 +209,7 @@ pub async fn run<H: Host>(host: H, out_rate: u32) -> H {
     if ctx.globals.launch_setup {
         ctx.host.launch_setup();
     } else if ctx.globals.open_url {
-        let url = online_url(&ctx);
-        ctx.host.open_url(&url);
+        ctx.host.open_url(ONLINE_URL);
     }
     ctx.host
 }

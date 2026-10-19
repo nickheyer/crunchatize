@@ -694,7 +694,7 @@ mod tests {
         d.extend_from_slice(b"data");
         d.extend_from_slice(&((frames * 2) as u32).to_le_bytes());
         for i in 0..frames {
-            d.extend_from_slice(&((i as i16) * 100).to_le_bytes());
+            d.extend_from_slice(&(i as i16).wrapping_mul(100).to_le_bytes());
         }
         d
     }

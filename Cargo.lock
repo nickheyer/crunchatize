@@ -176,6 +176,7 @@ dependencies = [
  "avmanager",
  "console_error_panic_hook",
  "crunch",
+ "crunch-pak",
  "js-sys",
  "wasm-bindgen",
  "wasm-bindgen-futures",

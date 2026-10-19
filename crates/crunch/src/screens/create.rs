@@ -634,10 +634,7 @@ mod tests {
         }
 
         fn poll_input(&mut self) -> DeviceState {
-            let state = self.device.clone();
-            self.device.mouse_dx = 0;
-            self.device.mouse_dy = 0;
-            state
+            self.device.clone()
         }
 
         async fn end_frame(&mut self, _frame: Option<&[u16]>, sound: &mut Sound) {
@@ -705,7 +702,7 @@ mod tests {
     fn tick(screen: &mut CreateScreen, ctx: &mut Ctx<DiscHost>) -> u32 {
         block_on(async {
             let device = ctx.host.poll_input();
-            ctx.av.input.heartbeat(&device);
+            ctx.av.input.heartbeat(&device, (ctx.cursor.x, ctx.cursor.y));
             let result = screen.update(ctx).await;
             ctx.av.swap_buffers(&mut ctx.host).await;
             result
@@ -713,8 +710,7 @@ mod tests {
     }
 
     fn move_cursor(ctx: &mut Ctx<DiscHost>, x: i16, y: i16) {
-        ctx.host.device.mouse_dx = (x - ctx.cursor.x) as i32 * 2;
-        ctx.host.device.mouse_dy = (y - ctx.cursor.y) as i32 * 2;
+        ctx.host.device.pointer = Some((x, y));
     }
 
     fn click(screen: &mut CreateScreen, ctx: &mut Ctx<DiscHost>, x: i16, y: i16) -> u32 {

@@ -147,7 +147,7 @@ fn boot_and_run(state: u32, p: PlayerData, ticks: usize) -> usize {
     assert!(block_on(game.switch_state(&mut ctx, state)), "state {state:#x} failed to initialise");
     for _ in 0..ticks {
         let device = ctx.host.poll_input();
-        ctx.av.input.heartbeat(&device);
+        ctx.av.input.heartbeat(&device, (ctx.cursor.x, ctx.cursor.y));
         ctx.av.sound.heartbeat();
         assert!(block_on(game.tick(&mut ctx)), "state {state:#x} asked to quit");
         block_on(ctx.av.swap_buffers(&mut ctx.host));
