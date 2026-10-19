@@ -472,6 +472,8 @@ impl Sound {
         for st in &mut self.streams {
             if st.active {
                 st.active = false;
+                st.stop();
+                st.source = None;
             }
         }
         for s in &mut self.sfx {
@@ -753,5 +755,24 @@ mod tests {
         }
         assert!(s.is_stream_sound_done(h));
         assert!(!s.streams[8].active);
+    }
+
+    #[test]
+    fn destroy_all_sounds_silences_a_playing_stream() {
+        let mut s = Sound::new(16, 22050);
+        let w = wav(4000);
+        let h = s.play_stream_sound(&w, true, 0);
+        for _ in 0..6 {
+            s.heartbeat();
+        }
+        let mut out = vec![0i16; 2 * 2000];
+        s.render(&mut out);
+        assert!(out.iter().any(|&v| v != 0));
+        s.destroy_all_sounds();
+        assert!(!s.streams[8].playing);
+        assert!(s.streams[8].source.is_none());
+        s.render(&mut out);
+        assert!(out.iter().all(|&v| v == 0));
+        assert!(!s.kill_streaming_channel(h));
     }
 }
