@@ -112,7 +112,12 @@ impl LoadCrunchScreen {
             }
             ID_DONE => result = STATE_HOME_WORLD,
             ID_CREDITS => result = STATE_CREDITS,
-            ID_VIEW_STORY => play_video_modal(&mut ctx.av, &mut ctx.host, "Intro.smk").await,
+            ID_VIEW_STORY => {
+                play_video_modal(&mut ctx.av, &mut ctx.host, "Intro.smk").await;
+                if !self.restore_sounds(ctx).await {
+                    result = RESULT_QUIT;
+                }
+            }
             ID_COFFEE => ctx.host.open_url(COFFEE_URL),
             ID_DELETE => {
                 self.delete_confirm = true;
@@ -139,6 +144,15 @@ impl LoadCrunchScreen {
             _ => {}
         }
         result
+    }
+
+    // Reloads the click sound and restarts the menu song after the video player tore every sound down
+    async fn restore_sounds<H: Host>(&mut self, ctx: &mut Ctx<H>) -> bool {
+        let Some(h) = ctx.av.get_sfx(&mut ctx.host, "Button1.wav", 0, false).await else { return false };
+        self.button_sfx = h;
+        self.music_channel =
+            ctx.av.play_stream_sound(&mut ctx.host, "crunchsong3.wav", true, self.music_channel).await;
+        true
     }
 
     fn on_actor_event<H: Host>(&mut self, ctx: &mut Ctx<H>, kind: i32, actor_id: i32) {
