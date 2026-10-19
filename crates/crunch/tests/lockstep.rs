@@ -8,7 +8,7 @@ use std::task::{Context, Poll, Waker};
 
 use avmanager::input::DeviceState;
 use avmanager::sound::Sound;
-use crunch::ctx::STATE_HOME_WORLD;
+use crunch::ctx::{STATE_HOME_WORLD, STATE_RUNNING};
 use crunch::game::Runner;
 use crunch::host::{Host, NetEvent};
 use crunch::online::dialog::Page;
@@ -31,6 +31,8 @@ const SCAN_E: usize = 0x12;
 const SCAN_S: usize = 0x1f;
 const SCAN_RETURN: usize = 0x1c;
 const SCAN_SPACE: usize = 0x39;
+const SCAN_RIGHT: usize = 0xcd;
+const SCAN_LEFT: usize = 0xcb;
 
 fn block_on<F: Future>(fut: F) -> F::Output {
     let mut fut = pin!(fut);
@@ -409,6 +411,46 @@ fn host_and_helper_stay_in_lockstep() {
     assert_eq!(host.hash(), joiner.hash(), "the worlds drifted apart after the speech");
     assert_eq!(joiner.runner.ctx.session.desyncs(), 0);
     assert!(!host.runner.ctx.host.log.iter().any(|l| l.contains("lost sync")), "{:?}", host.runner.ctx.host.log);
+
+    // Both switch to the thief's skate race, where the friend drives the thief with their own keys
+    for p in [&mut host, &mut joiner] {
+        p.runner.ctx.player.challenge_active = 1;
+        assert!(block_on(p.runner.game.switch_state(&mut p.runner.ctx, STATE_RUNNING)));
+    }
+    assert_eq!(host.runner.ctx.session.helper_name, "MATE");
+    host.keys(&[SCAN_SPACE]);
+    steps(&mut host, &mut joiner, 4);
+    host.keys(&[SCAN_RIGHT]);
+    let (start_x, _) = host.runner.ctx.actors.pos(0);
+    let mut racing = false;
+    for _ in 0..900 {
+        step(&mut host, &mut joiner);
+        if host.runner.ctx.actors.pos(0).0 > start_x + 30.0 {
+            racing = true;
+            break;
+        }
+    }
+    assert!(racing, "the race never started");
+    let (thief_x, _) = host.runner.ctx.actors.pos(1);
+    steps(&mut host, &mut joiner, 30);
+    let (thief_still, _) = host.runner.ctx.actors.pos(1);
+    assert!(thief_still < thief_x, "the thief moved on its own while the friend held nothing");
+    host.keys(&[SCAN_LEFT]);
+    joiner.keys(&[SCAN_RIGHT]);
+    steps(&mut host, &mut joiner, 30);
+    let (thief_driven, _) = host.runner.ctx.actors.pos(1);
+    assert!(thief_driven > thief_still, "the friend's right key did not drive the thief");
+    host.keys(&[]);
+    joiner.keys(&[]);
+    steps(&mut host, &mut joiner, 10);
+    assert_eq!(host.hash(), joiner.hash(), "the worlds drifted apart in the race");
+    assert_eq!(joiner.runner.ctx.session.desyncs(), 0);
+    for p in [&mut host, &mut joiner] {
+        p.runner.ctx.player.challenge_active = 0;
+        assert!(block_on(p.runner.game.switch_state(&mut p.runner.ctx, STATE_HOME_WORLD)));
+    }
+    steps(&mut host, &mut joiner, 20);
+    assert_eq!(host.hash(), joiner.hash(), "the worlds drifted apart back home");
 
     // The host quits, the helper returns to their own crunchling with the box explaining why
     host.point(QUIT_BUTTON, false);

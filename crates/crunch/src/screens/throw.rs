@@ -216,7 +216,8 @@ impl ThrowScreen {
             ctx.scene.assign_id("GoodJob", OBJ_GOOD_JOB);
             ctx.scene.set_hover_by_id(OBJ_GOOD_JOB, HOVER_HIDDEN);
             ctx.scene.set_text_by_id(OBJ_TIME, "0");
-            ctx.scene.set_text_by_id(OBJ_TIME_TEXT, "Thief");
+            let thief_label = if ctx.session.helper_present() { ctx.session.helper_name.clone() } else { "Thief".into() };
+            ctx.scene.set_text_by_id(OBJ_TIME_TEXT, &thief_label);
             let name = ctx.player.name_str();
             ctx.scene.set_text_by_id(OBJ_SCORE_TEXT, &name);
         }
@@ -489,9 +490,20 @@ impl ThrowScreen {
                     let text = format!(" {}", self.seconds_left as u16);
                     ctx.scene.set_text_by_id(OBJ_TIME, &text);
                 } else if self.thief_state != PS_THROWING && self.thief_state != PS_RELOADING {
-                    ctx.av.play_sfx(self.sfx[S_ROCKTHROWER2], -1);
-                    set_actor_anim(ctx, ACTOR_THIEF, self.anims[A_THIEF_THROW], true, STATE_RESTART_FORWARD);
-                    self.thief_state = PS_THROWING;
+                    if !ctx.session.helper_present() || ctx.helper_key_down(KEY_SPACE) {
+                        ctx.av.play_sfx(self.sfx[S_ROCKTHROWER2], -1);
+                        set_actor_anim(ctx, ACTOR_THIEF, self.anims[A_THIEF_THROW], true, STATE_RESTART_FORWARD);
+                        self.thief_state = PS_THROWING;
+                    } else {
+                        let (mut x, _) = ctx.actors.pos(ACTOR_THIEF);
+                        if ctx.helper_key_down(KEY_RIGHT) {
+                            x = (x + STEP).min(RIGHT_CLAMP);
+                        }
+                        if ctx.helper_key_down(KEY_LEFT) {
+                            x = (x - STEP).max(LEFT_CLAMP);
+                        }
+                        ctx.actors.set_x(ACTOR_THIEF, x);
+                    }
                 }
                 if self.challenge_phase == PHASE_NORMAL && self.ptero_respawn != 0 {
                     if self.ptero_respawn == 0x14 {

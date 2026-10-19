@@ -273,7 +273,19 @@ def make_panel(out_dir, data_dir, small_glyphs, small_w):
     write_bam(os.path.join(out_dir, "onlinebox.bam"), panel, fps=15)
 
 
-# Stretches the no pill plate to the Go Online width and stamps a white label on it
+# Blends two pill columns across a span so the plate's own shading stretches with it
+def blend_columns(src, x0, x1, width):
+    out = Image.new("RGBA", (width, src.size[1]))
+    a = [src.getpixel((x0, y)) for y in range(src.size[1])]
+    b = [src.getpixel((x1, y)) for y in range(src.size[1])]
+    for x in range(width):
+        t = x / max(width - 1, 1)
+        for y in range(src.size[1]):
+            out.putpixel((x, y), tuple(round(a[y][c] * (1 - t) + b[y][c] * t) for c in range(4)))
+    return out
+
+
+# Widens the no pill plate to the Go Online width from its own clean columns and stamps a white label
 def make_pill(out_dir, data_dir, label, glyphs, width, height):
     pill_glyphs = {ch: scale_rgba(whiten(glyphs[ch]), FONT_SCALE_PILL) for ch in label.upper()}
     cell_w = round(width * FONT_SCALE_PILL)
@@ -281,12 +293,15 @@ def make_pill(out_dir, data_dir, label, glyphs, width, height):
     for variant in ["cold", "hot"]:
         src = bam_image(read_bam(os.path.join(data_dir, f"deletebox_no_{variant}.bam")))
         sw, sh = src.size
-        left_w, right_w = 30, 18
-        middle_w = PILL_W - left_w - right_w
+        left_w, mid_col, right_from = 28, 41, 58
+        right_w = sw - right_from
+        span = PILL_W - left_w - right_w
+        first, second = span // 2, span - span // 2
         plate = Image.new("RGBA", (PILL_W, sh), (0, 0, 0, 0))
         plate.paste(src.crop((0, 0, left_w, sh)), (0, 0))
-        plate.paste(src.crop((72, 0, 73, sh)).resize((middle_w, sh), Image.Resampling.NEAREST), (left_w, 0))
-        plate.paste(src.crop((sw - right_w, 0, sw, sh)), (PILL_W - right_w, 0))
+        plate.paste(blend_columns(src, left_w, mid_col, first), (left_w, 0))
+        plate.paste(blend_columns(src, mid_col, right_from, second), (left_w + first, 0))
+        plate.paste(src.crop((right_from, 0, sw, sh)), (left_w + span, 0))
         opaque_right = max(x for x in range(PILL_W) if plate.getpixel((x, sh // 2))[3])
         draw_text(plate, label.upper(), pill_glyphs, cell_w, (opaque_right + 1) // 2, (sh - cell_h) // 2)
         write_bam(os.path.join(out_dir, f"online_{label}_{variant}.bam"), plate, fps=15)

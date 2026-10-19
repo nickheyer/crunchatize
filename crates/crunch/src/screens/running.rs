@@ -221,13 +221,24 @@ impl RunningScreen {
         self.slots.push(ObstacleSlot { actor_id, kind, idle, alt, hit: false, active: false });
     }
 
-    // Accelerates the opponent toward its cap until its own finish then brakes it to a stop
-    fn update_opponent_speed(&mut self) {
+    // Runs the opponent on its own until its finish, or by the friend's right and left keys, then brakes it
+    fn update_opponent_speed(&mut self, friend: Option<(bool, bool)>) {
         self.opp_finish_dist -= self.opp_speed;
         if 0.0 <= self.opp_finish_dist {
-            self.opp_speed += self.opp_accel;
-            if self.opp_max_speed < self.opp_speed {
-                self.opp_speed = self.opp_max_speed;
+            match friend {
+                None | Some((true, _)) => {
+                    self.opp_speed += self.opp_accel;
+                    if self.opp_max_speed < self.opp_speed {
+                        self.opp_speed = self.opp_max_speed;
+                    }
+                }
+                Some((false, true)) => {
+                    self.opp_speed -= self.opp_decel;
+                    if self.opp_speed < 0.0 {
+                        self.opp_speed = 0.0;
+                    }
+                }
+                Some((false, false)) => {}
             }
         } else {
             self.opp_speed = (f64::from(self.opp_speed) - f64::from(self.opp_decel) * f64::from(0.4f32)) as f32;
@@ -665,7 +676,11 @@ impl<H: Host> Screen<H> for RunningScreen {
                     ctx.actors.set_visible(ACTOR_SIGN, false);
                 }
             }
-            self.update_opponent_speed();
+            let friend = ctx
+                .session
+                .helper_present()
+                .then(|| (ctx.helper_key_down(KEY_RIGHT), ctx.helper_key_down(KEY_LEFT)));
+            self.update_opponent_speed(friend);
             self.cross_dist -= self.speed;
             if self.cross_dist < 0.0 {
                 self.speed = (f64::from(self.speed) - f64::from(self.brake) * f64::from(0.8f32)) as f32;
@@ -1097,12 +1112,27 @@ mod tests {
         g.opp_accel = 0.7;
         g.opp_decel = 1.2;
         g.opp_speed = 13.8;
-        g.update_opponent_speed();
+        g.update_opponent_speed(None);
         assert_eq!(g.opp_speed, 14.0);
-        g.update_opponent_speed();
+        g.update_opponent_speed(None);
         assert_eq!(g.opp_speed, (14.0f64 - f64::from(1.2f32) * f64::from(0.4f32)) as f32);
         g.opp_speed = 0.1;
-        g.update_opponent_speed();
+        g.update_opponent_speed(None);
+        assert_eq!(g.opp_speed, 0.0);
+    }
+
+    #[test]
+    fn friend_keys_drive_the_opponent() {
+        let mut g = RunningScreen::new();
+        g.opp_finish_dist = 1000.0;
+        g.opp_max_speed = 14.0;
+        g.opp_accel = 0.7;
+        g.opp_decel = 1.2;
+        g.update_opponent_speed(Some((false, false)));
+        assert_eq!(g.opp_speed, 0.0);
+        g.update_opponent_speed(Some((true, false)));
+        assert_eq!(g.opp_speed, 0.7);
+        g.update_opponent_speed(Some((false, true)));
         assert_eq!(g.opp_speed, 0.0);
     }
 

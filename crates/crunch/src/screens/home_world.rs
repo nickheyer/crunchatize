@@ -1286,7 +1286,7 @@ impl HomeWorldScreen {
                 self.caster_y -= CASTER_STEP;
             }
         } else if CASTER_SHOWN_Y <= self.caster_y {
-            if ctx.av.is_key_down(KEY_SPACE) || ctx.stream_done(self.voice_channel) {
+            if ctx.av.is_key_down(KEY_SPACE) || ctx.helper_key_down(KEY_SPACE) || ctx.stream_done(self.voice_channel) {
                 ctx.av.kill_streaming_channel(self.voice_channel);
                 ctx.cursor.set_visible(true);
                 self.idle(ctx);

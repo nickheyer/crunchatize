@@ -7,7 +7,7 @@ use crate::actors::{
     EVENT_PICKUP, EVENT_UNATTACHED, FACING_LEFT, FACING_NONE, FACING_RIGHT,
 };
 use crate::ctx::{
-    Ctx, KEY_ESC, KEY_LEFT, KEY_RIGHT, KEY_SPACE, MOUSE_LEFT, RESULT_CONTINUE, STATE_CHALLENGE, STATE_HOME_WORLD,
+    Ctx, KEY_ESC, KEY_LEFT, KEY_RIGHT, KEY_SPACE, KEY_UP, MOUSE_LEFT, RESULT_CONTINUE, STATE_CHALLENGE, STATE_HOME_WORLD,
     STATE_JUMPING, Screen,
 };
 use crate::host::Host;
@@ -419,17 +419,19 @@ impl JumpScreen {
         }
         if self.challenge != 0 {
             let climb = self.anims[ANIM_THIEF_CLIMB_B];
-            if self.thief_state == THIEF_STOPPED {
-                ctx.actors.set_anims(&ctx.av, ACTOR_THIEF, climb, climb, false, STATE_RESTART_FORWARD);
-                self.thief_state = THIEF_CLIMBING;
-            } else if self.thief_y <= 100.0 {
-                if self.thief_state == THIEF_CLIMBING {
-                    ctx.actors.set_anims(&ctx.av, ACTOR_THIEF, climb, climb, false, STATE_STOPPED);
-                    self.thief_state = THIEF_STOPPED;
+            let friend_holds = ctx.helper_key_down(KEY_SPACE) || ctx.helper_key_down(KEY_UP);
+            let climbing = self.thief_y > 100.0 && (!ctx.session.helper_present() || friend_holds);
+            if climbing {
+                if self.thief_state == THIEF_STOPPED {
+                    ctx.actors.set_anims(&ctx.av, ACTOR_THIEF, climb, climb, false, STATE_RESTART_FORWARD);
+                    self.thief_state = THIEF_CLIMBING;
+                } else {
+                    self.thief_y -= 3.0;
+                    ctx.actors.set_y(ACTOR_THIEF, self.thief_y);
                 }
-            } else {
-                self.thief_y -= 3.0;
-                ctx.actors.set_y(ACTOR_THIEF, self.thief_y);
+            } else if self.thief_state == THIEF_CLIMBING {
+                ctx.actors.set_anims(&ctx.av, ACTOR_THIEF, climb, climb, false, STATE_STOPPED);
+                self.thief_state = THIEF_STOPPED;
             }
         }
         if (self.player_state == PLAYER_STANDING || self.player_state == PLAYER_RUNNING) && ctx.av.is_key_down(KEY_SPACE) {

@@ -83,6 +83,11 @@ impl<H: Host> Ctx<H> {
         self.session.time_ms(self.host.time_ms())
     }
 
+    // True while the friend holds a key, always false without a friend in the world
+    pub fn helper_key_down(&self, code: i32) -> bool {
+        self.session.helper_present() && self.session.helper_keys.is_key_down(code)
+    }
+
     // Whether a streamed voice finished, answered from the host's record when replaying
     pub fn stream_done(&mut self, channel: u32) -> bool {
         if let Some(done) = self.session.replay_bool() {

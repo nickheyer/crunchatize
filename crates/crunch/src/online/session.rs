@@ -105,6 +105,8 @@ pub struct Session {
     helper_input: DeviceState,
     last_sent: Option<DeviceState>,
     pub helper: Hand,
+    pub helper_keys: Input,
+    pub helper_name: String,
     pub local_hand: Hand,
     pub local: Input,
     pub helper_art: u16,
@@ -137,6 +139,8 @@ impl Session {
             helper_input: DeviceState::new(),
             last_sent: None,
             helper: Hand::default(),
+            helper_keys: Input::new(MOUSE_SENSITIVITY),
+            helper_name: String::new(),
             local_hand: Hand::default(),
             local: Input::new(MOUSE_SENSITIVITY),
             helper_art: NO_HANDLE,
@@ -236,24 +240,25 @@ impl Session {
         self.tick_time.unwrap_or(real)
     }
 
-    // Freezes the clock for a tick and, while hosting with a friend, merges their keys and starts a record
+    // Freezes the clock for a tick and, while hosting with a friend, samples their hand and starts a record
     pub fn begin_tick(&mut self, now: u32, device: DeviceState) -> DeviceState {
         self.tick_time = Some(now);
         if !matches!(self.phase, Phase::HostPlaying { .. }) {
             return device;
         }
-        self.helper.apply(&self.helper_input);
-        let merged = wire::merge_inputs(&device, &self.helper_input);
+        let helper = self.helper_input.clone();
+        self.helper.apply(&helper);
+        self.helper_keys.heartbeat(&helper, (self.helper.x, self.helper.y));
         self.recording = Some(TickRecord {
             epoch: self.epoch,
             seq: self.seq,
             time_ms: now,
-            host: device,
-            helper: self.helper_input.clone(),
+            host: device.clone(),
+            helper,
             log: Vec::new(),
             hash: 0,
         });
-        merged
+        device
     }
 
     // Sends the finished record with the state hash the friend must reproduce
@@ -270,13 +275,14 @@ impl Session {
         if matches!(self.phase, Phase::JoinPlaying { .. }) { self.queue.pop_front() } else { None }
     }
 
-    // Installs a host record as this tick's clock, sound answers and inputs
+    // Installs a host record as this tick's clock, sound answers and both players' inputs
     pub fn begin_replay(&mut self, record: &TickRecord) -> DeviceState {
         self.tick_time = Some(record.time_ms);
         self.replay = Some((record.log.clone(), 0));
         self.replay_overrun = false;
         self.helper.apply(&record.helper);
-        wire::merge_inputs(&record.host, &record.helper)
+        self.helper_keys.heartbeat(&record.helper, (self.helper.x, self.helper.y));
+        record.host.clone()
     }
 
     // Compares the state after a replayed tick with the host's hash and reports the first mismatch
@@ -345,7 +351,8 @@ pub fn poll_net<H: Host>(ctx: &mut Ctx<H>) {
 fn on_open<H: Host>(ctx: &mut Ctx<H>) {
     if let Phase::JoinConnecting { code } = &ctx.session.phase {
         let code = code.clone();
-        ctx.host.net_send(&wire::encode(&Message::Hello { protocol: PROTOCOL }));
+        let hello = Message::Hello { protocol: PROTOCOL, name: ctx.player.name_str() };
+        ctx.host.net_send(&wire::encode(&hello));
         ctx.session.phase = Phase::JoinWaiting { code };
     }
 }
@@ -358,15 +365,19 @@ fn on_message<H: Host>(ctx: &mut Ctx<H>, message: Message) {
                 ctx.session.phase = Phase::HostWaiting { code };
             }
         }
-        Message::Hello { protocol } => match &ctx.session.phase {
-            Phase::HostWaiting { .. } | Phase::HostPlaying { .. } if protocol == PROTOCOL => start_as_host(ctx),
+        Message::Hello { protocol, name } => match &ctx.session.phase {
+            Phase::HostWaiting { .. } | Phase::HostPlaying { .. } if protocol == PROTOCOL => {
+                ctx.session.helper_name = name;
+                start_as_host(ctx);
+            }
             Phase::HostWaiting { .. } | Phase::HostPlaying { .. } => {
                 ctx.host.log(&format!("online: a friend with protocol {protocol} tried to join, this build speaks {PROTOCOL}"));
             }
             _ => {}
         },
-        Message::Start { epoch, seed, player } => {
+        Message::Start { epoch, seed, player, helper_name } => {
             if matches!(ctx.session.phase, Phase::JoinWaiting { .. } | Phase::JoinPlaying { .. }) {
+                ctx.session.helper_name = helper_name;
                 begin_joined(ctx, epoch, seed, player);
             }
         }
@@ -439,11 +450,17 @@ fn start_as_host<H: Host>(ctx: &mut Ctx<H>) {
     session.epoch += 1;
     session.seq = 0;
     let seed = ctx.host.unix_time().wrapping_mul(0x9e37_79b1) ^ ctx.host.time_ms().rotate_left(7) ^ session.epoch;
-    let start = Message::Start { epoch: session.epoch, seed, player: ctx.player.clone() };
+    let start = Message::Start {
+        epoch: session.epoch,
+        seed,
+        player: ctx.player.clone(),
+        helper_name: session.helper_name.clone(),
+    };
     ctx.host.net_send(&wire::encode(&start));
     ctx.rand.srand(seed);
     session.phase = Phase::HostPlaying { code };
     session.helper = Hand::default();
+    session.helper_keys = Input::new(MOUSE_SENSITIVITY);
     session.helper_input = DeviceState::new();
     session.recording = None;
     session.notice = Notice::FriendJoined;
@@ -466,6 +483,7 @@ fn begin_joined<H: Host>(ctx: &mut Ctx<H>, epoch: u32, seed: u32, player: Player
     session.replay = None;
     session.tick_time = None;
     session.helper = Hand::default();
+    session.helper_keys = Input::new(MOUSE_SENSITIVITY);
     session.last_sent = None;
     session.desync_sent = false;
     session.notice = Notice::FriendJoined;

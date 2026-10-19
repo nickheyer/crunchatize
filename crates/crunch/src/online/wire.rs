@@ -1,6 +1,6 @@
 use avmanager::input::DeviceState;
 
-use crate::player::{PlayerData, SAVE_SIZE};
+use crate::player::{NAME_CAPACITY, PlayerData, SAVE_SIZE};
 
 pub const PROTOCOL: u8 = 1;
 pub const CODE_LEN: usize = 4;
@@ -20,8 +20,8 @@ const DEVICE_LEN: usize = KEY_BYTES + 4 + 4 + 1 + 4 + 1;
 // Everything one side of a session says to the other, plus the two notices the server adds
 #[derive(Clone, Debug, PartialEq)]
 pub enum Message {
-    Hello { protocol: u8 },
-    Start { epoch: u32, seed: u32, player: PlayerData },
+    Hello { protocol: u8, name: String },
+    Start { epoch: u32, seed: u32, player: PlayerData, helper_name: String },
     Tick(Box<TickRecord>),
     Input(DeviceState),
     Leave,
@@ -80,6 +80,20 @@ fn get_device(bytes: &[u8]) -> Option<DeviceState> {
     Some(d)
 }
 
+fn put_name(out: &mut Vec<u8>, name: &str) {
+    let mut field = [0u8; NAME_CAPACITY];
+    let bytes = name.as_bytes();
+    let n = bytes.len().min(NAME_CAPACITY - 1);
+    field[..n].copy_from_slice(&bytes[..n]);
+    out.extend_from_slice(&field);
+}
+
+fn get_name(bytes: &[u8], at: usize) -> Option<String> {
+    let field = bytes.get(at..at + NAME_CAPACITY)?;
+    let end = field.iter().position(|&c| c == 0).unwrap_or(NAME_CAPACITY);
+    Some(String::from_utf8_lossy(&field[..end]).into_owned())
+}
+
 fn get_u32(bytes: &[u8], at: usize) -> Option<u32> {
     let b = bytes.get(at..at + 4)?;
     Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -88,12 +102,16 @@ fn get_u32(bytes: &[u8], at: usize) -> Option<u32> {
 pub fn encode(msg: &Message) -> Vec<u8> {
     let mut out = Vec::new();
     match msg {
-        Message::Hello { protocol } => out.extend_from_slice(&[TAG_HELLO, *protocol]),
-        Message::Start { epoch, seed, player } => {
+        Message::Hello { protocol, name } => {
+            out.extend_from_slice(&[TAG_HELLO, *protocol]);
+            put_name(&mut out, name);
+        }
+        Message::Start { epoch, seed, player, helper_name } => {
             out.push(TAG_START);
             out.extend_from_slice(&epoch.to_le_bytes());
             out.extend_from_slice(&seed.to_le_bytes());
             out.extend_from_slice(&player.to_bytes());
+            put_name(&mut out, helper_name);
         }
         Message::Tick(t) => {
             out.push(TAG_TICK);
@@ -135,12 +153,13 @@ pub fn encode(msg: &Message) -> Vec<u8> {
 pub fn decode(bytes: &[u8]) -> Option<Message> {
     let (&tag, body) = bytes.split_first()?;
     match tag {
-        TAG_HELLO => Some(Message::Hello { protocol: *body.first()? }),
+        TAG_HELLO => Some(Message::Hello { protocol: *body.first()?, name: get_name(body, 1)? }),
         TAG_START => {
             let epoch = get_u32(body, 0)?;
             let seed = get_u32(body, 4)?;
             let raw: [u8; SAVE_SIZE as usize] = body.get(8..8 + SAVE_SIZE as usize)?.try_into().ok()?;
-            Some(Message::Start { epoch, seed, player: PlayerData::from_bytes(&raw) })
+            let helper_name = get_name(body, 8 + SAVE_SIZE as usize)?;
+            Some(Message::Start { epoch, seed, player: PlayerData::from_bytes(&raw), helper_name })
         }
         TAG_TICK => {
             let epoch = get_u32(body, 0)?;
@@ -165,15 +184,6 @@ pub fn decode(bytes: &[u8]) -> Option<Message> {
         TAG_PEER_LEFT => Some(Message::PeerLeft),
         _ => None,
     }
-}
-
-// Keys of both players together with the host's pointer and buttons
-pub fn merge_inputs(host: &DeviceState, helper: &DeviceState) -> DeviceState {
-    let mut merged = host.clone();
-    for (key, &down) in merged.scan_keys.iter_mut().zip(helper.scan_keys.iter()) {
-        *key |= down;
-    }
-    merged
 }
 
 #[cfg(test)]
@@ -206,8 +216,8 @@ mod tests {
             hash: 0x1234_5678,
         };
         for msg in [
-            Message::Hello { protocol: PROTOCOL },
-            Message::Start { epoch: 1, seed: 99, player },
+            Message::Hello { protocol: PROTOCOL, name: "MATE".into() },
+            Message::Start { epoch: 1, seed: 99, player, helper_name: "MATEY".into() },
             Message::Tick(Box::new(tick)),
             Message::Input(device()),
             Message::Leave,
@@ -229,14 +239,11 @@ mod tests {
     }
 
     #[test]
-    fn merge_keeps_host_pointer_and_unions_keys() {
-        let mut helper = DeviceState::new();
-        helper.scan_keys[0x1e] = true;
-        helper.pointer = Some((1, 1));
-        helper.buttons = [true; 3];
-        let merged = merge_inputs(&device(), &helper);
-        assert!(merged.scan_keys[0x1e] && merged.scan_keys[0x39]);
-        assert_eq!(merged.pointer, Some((-3, 479)));
-        assert_eq!(merged.buttons, [true, false, true]);
+    fn names_are_cut_to_the_save_field() {
+        let long = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".to_string();
+        let Some(Message::Hello { name, .. }) = decode(&encode(&Message::Hello { protocol: PROTOCOL, name: long })) else {
+            panic!("hello did not decode");
+        };
+        assert_eq!(name, "ABCDEFGHIJKLMNO");
     }
 }
