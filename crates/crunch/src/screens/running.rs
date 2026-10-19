@@ -789,7 +789,7 @@ impl<H: Host> Screen<H> for RunningScreen {
                     self.state = PS_GETTING_UP;
                 }
             }
-            let now = ctx.host.time_ms();
+            let now = ctx.time_ms();
             let mut dt = now.wrapping_sub(self.last_tick_ms) as f32;
             if self.timer_resync {
                 dt = 0.0;
@@ -816,7 +816,7 @@ impl<H: Host> Screen<H> for RunningScreen {
                 self.commentator = COMM_TV_IDLE;
                 self.voice = ctx.av.play_stream_sound(&mut ctx.host, "049.wav", false, self.voice).await;
                 self.challenge += 1;
-            } else if ctx.av.is_stream_sound_done(self.voice) {
+            } else if ctx.stream_done(self.voice) {
                 self.challenge += 1;
             }
             if self.countdown == 0x28 {
@@ -884,12 +884,12 @@ impl<H: Host> Screen<H> for RunningScreen {
                     self.commentator = COMM_TV_IDLE;
                 }
             }
-            COMM_INTRO_SPEECH if ctx.av.is_stream_sound_done(self.voice) || ctx.av.is_key_down(KEY_SPACE) => {
+            COMM_INTRO_SPEECH if ctx.stream_done(self.voice) || ctx.av.is_key_down(KEY_SPACE) => {
                 ctx.av.kill_streaming_channel(self.voice);
                 self.commentator = COMM_DRIVE_OUT;
                 self.intro_pending = false;
             }
-            COMM_TV_SPEECH if ctx.av.is_stream_sound_done(self.voice) => {
+            COMM_TV_SPEECH if ctx.stream_done(self.voice) => {
                 ctx.actors.set_anims(&ctx.av, ACTOR_CAPN, a[A_TV_005], a[A_TV_005], false, STATE_RESTART_FORWARD);
                 self.commentator = COMM_TV_IDLE;
             }
@@ -924,7 +924,7 @@ impl<H: Host> Screen<H> for RunningScreen {
                     ctx.actors.add_x(ACTOR_CAR, self.car_speed);
                 }
             }
-            COMM_END_SPEECH if ctx.av.is_stream_sound_done(self.voice) => {
+            COMM_END_SPEECH if ctx.stream_done(self.voice) => {
                 self.commentator = COMM_STANDING;
                 ctx.actors.set_anims(&ctx.av, ACTOR_CAPN, a[A_CAPN_028], a[A_CAPN_028], false, STATE_RESTART_FORWARD);
             }

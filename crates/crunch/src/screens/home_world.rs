@@ -5,15 +5,16 @@ use avmanager::texture::Palette24;
 
 use crate::actors::{
     EVENT_ANIM_END, EVENT_INIT_OBJECT, EVENT_MOUSE_HIT, EVENT_TARGET_REACHED, EVENT_TIMER, FACING_FORCE_NONE,
-    FACING_NONE, NO_TARGET,
+    FACING_NONE, NO_HANDLE, NO_TARGET,
 };
 use crate::ctx::{
     Ctx, KEY_DOWN, KEY_LCTRL, KEY_LSHIFT, KEY_RCTRL, KEY_RIGHT, KEY_RSHIFT, KEY_SPACE, KEY_UP, MOUSE_LEFT,
     RESULT_CONTINUE, RESULT_QUIT, STATE_CHALLENGE, STATE_HOME_WORLD, STATE_JUMPING, STATE_RUNNING, STATE_THROWING,
     Screen,
 };
-use crate::game::ONLINE_URL;
+use crate::cursor::Cursor;
 use crate::host::Host;
+use crate::online::Who;
 use crate::player::PlayerData;
 use crate::scene::{HOVER_HIDDEN, HOVER_NORMAL, HOVER_PRESSED};
 
@@ -107,7 +108,8 @@ const ANIM_MOUSE_QTIP: u16 = 0x27;
 const ANIM_SHADOW: u16 = 0x28;
 const ANIM_BAR_DARK: u16 = 0x29;
 const ANIM_MINIBAR: u16 = 0x2a;
-const ANIM_COUNT: usize = 0x2b;
+const ANIM_MOUSE_ONLINE: u16 = 0x2b;
+const ANIM_COUNT: usize = 0x2c;
 
 const KEY_7: i32 = 8;
 const KEY_0: i32 = 0xb;
@@ -163,6 +165,9 @@ fn minibar_width(stat: i32) -> Option<u16> {
 // The crunchling's home with feeding, tools, training doors and the Cap'n sequences
 pub struct HomeWorldScreen {
     mouse_latched: bool,
+    helper_latched: bool,
+    helper_cursor_index: u16,
+    helper_cursor: Cursor,
     loop_channel: u32,
     voice_channel: u32,
     last_walk_state: u32,
@@ -212,6 +217,9 @@ impl HomeWorldScreen {
     pub fn new() -> Self {
         Self {
             mouse_latched: false,
+            helper_latched: false,
+            helper_cursor_index: 0,
+            helper_cursor: Cursor::default(),
             loop_channel: 0,
             voice_channel: 0,
             last_walk_state: 0,
@@ -433,6 +441,9 @@ impl HomeWorldScreen {
             return false;
         }
         if !self.load_anim(ctx, ANIM_MOUSE_QTIP, "mouse_qtip").await {
+            return false;
+        }
+        if !self.load_anim(ctx, ANIM_MOUSE_ONLINE, "mouse_online").await {
             return false;
         }
         if !self.load_anim(ctx, ANIM_SHADOW, "shadow").await {
@@ -674,8 +685,8 @@ impl HomeWorldScreen {
         }
     }
 
-    // Reacts to a click on a WAM object, returning 2 for Quit and online and 1 otherwise
-    async fn on_object_clicked<H: Host>(&mut self, ctx: &mut Ctx<H>, obj: i32) -> u32 {
+    // Reacts to a hand clicking a WAM object, returning 2 when the player's own hand picked Quit and 1 otherwise
+    async fn on_object_clicked<H: Host>(&mut self, ctx: &mut Ctx<H>, obj: i32, who: Who) -> u32 {
         let mut result = RESULT_CONTINUE;
         let mut fed = false;
         match obj {
@@ -726,8 +737,8 @@ impl HomeWorldScreen {
                     ctx.player.tips_index = 0;
                 }
             }
-            OBJ_QUIT => result = RESULT_QUIT,
-            OBJ_ONLINE => ctx.host.open_url(ONLINE_URL),
+            OBJ_QUIT if who == Who::Primary => result = RESULT_QUIT,
+            OBJ_ONLINE => ctx.session.request_dialog(who),
             _ => {}
         }
         if self.capn_sequence != SEQ_NONE {
@@ -867,20 +878,27 @@ impl HomeWorldScreen {
                     }
                 }
             }
-            EVENT_MOUSE_HIT => self.on_mouse_hit(ctx),
+            EVENT_MOUSE_HIT => {
+                let my = i32::from(ctx.cursor.y);
+                let down = ctx.av.is_mouse_button_down(MOUSE_LEFT);
+                self.on_mouse_hit_at(ctx, my, down, Who::Primary);
+            }
             EVENT_TIMER => self.on_timer(ctx, actor).await,
             _ => {}
         }
     }
 
-    // Picks the tool cursor from the mouse height zone and starts tickle, dance or qtip on a click
-    fn on_mouse_hit<H: Host>(&mut self, ctx: &mut Ctx<H>) {
-        if self.cursor_index != ANIM_MOUSE {
+    // Picks a hand's tool from its height over the crunchling and starts tickle, dance or qtip on a click
+    fn on_mouse_hit_at<H: Host>(&mut self, ctx: &mut Ctx<H>, my: i32, down: bool, who: Who) {
+        let mut tool = match who {
+            Who::Primary => self.cursor_index,
+            Who::Helper => self.helper_cursor_index,
+        };
+        if tool != ANIM_MOUSE {
             return;
         }
-        let my = ctx.cursor.y as i32;
         if self.crunchling_state == CL_SLEEP {
-            self.cursor_index = ANIM_MOUSE_HAND;
+            tool = ANIM_MOUSE_HAND;
         } else {
             let mut stage = ctx.player.stage as u32;
             if stage != 0 && ctx.player.transform_pending != 0 {
@@ -888,27 +906,27 @@ impl HomeWorldScreen {
             }
             let row = &POS_TABLE[pos_table_row(&ctx.player)];
             if stage == 0 && row[COL_FEATHER_MIN] < my {
-                self.cursor_index = ANIM_MOUSE_FEATHER;
+                tool = ANIM_MOUSE_FEATHER;
             } else if row[COL_HAND_MIN] < my && my <= row[COL_HAND_MAX] {
-                self.cursor_index = ANIM_MOUSE_HAND;
+                tool = ANIM_MOUSE_HAND;
             } else if stage == 1 && row[COL_HAND_MAX] < my && my < row[COL_HAND_MAX] + 0x14 {
-                self.cursor_index = ANIM_MOUSE_QTIP;
+                tool = ANIM_MOUSE_QTIP;
             }
         }
-        if ctx.av.is_mouse_button_down(MOUSE_LEFT)
+        if down
             && self.crunchling_state != CL_PLAYING
             && self.crunchling_state != CL_QTIP_OUT
             && self.crunchling_state != CL_QTIP_EAR_LOOP
             && self.crunchling_state != CL_QTIP_DISGUST
         {
-            if self.cursor_index == ANIM_MOUSE_FEATHER {
+            if tool == ANIM_MOUSE_FEATHER {
                 ctx.av.play_sfx(self.sfx_giggle, -1);
                 self.set_crunchling_anim(ctx, ANIM_TICKLE, true, STATE_RESTART_FORWARD);
                 ctx.actors.face(&ctx.av, ACTOR_CRUNCHLING, FACING_FORCE_NONE);
                 ctx.actors.walk_to(&ctx.av, ACTOR_CRUNCHLING, NO_TARGET);
                 ctx.actors.set_timer(ACTOR_CRUNCHLING, 0);
                 self.crunchling_state = CL_PLAYING;
-            } else if self.cursor_index == ANIM_MOUSE_HAND {
+            } else if tool == ANIM_MOUSE_HAND {
                 ctx.av.play_sfx(self.sfx_praise, -1);
                 self.set_crunchling_anim(ctx, ANIM_DANCE, true, STATE_RESTART_FORWARD);
                 ctx.actors.face(&ctx.av, ACTOR_CRUNCHLING, FACING_FORCE_NONE);
@@ -916,7 +934,7 @@ impl HomeWorldScreen {
                 ctx.actors.set_timer(ACTOR_CRUNCHLING, 0);
                 ctx.actors.set_y(ACTOR_CRUNCHLING, GROUND_Y);
                 self.crunchling_state = CL_PLAYING;
-            } else if self.cursor_index == ANIM_MOUSE_QTIP {
+            } else if tool == ANIM_MOUSE_QTIP {
                 self.set_crunchling_anim(ctx, ANIM_QTIP_OUT, true, STATE_RESTART_FORWARD);
                 ctx.actors.face(&ctx.av, ACTOR_CRUNCHLING, FACING_FORCE_NONE);
                 ctx.actors.walk_to(&ctx.av, ACTOR_CRUNCHLING, NO_TARGET);
@@ -926,10 +944,50 @@ impl HomeWorldScreen {
             } else {
                 self.idle(ctx);
             }
-            if self.cursor_index != ANIM_MOUSE && ctx.player.happiness < 5 {
+            if tool != ANIM_MOUSE && ctx.player.happiness < 5 {
                 ctx.player.happiness += 1;
             }
         }
+        match who {
+            Who::Primary => self.cursor_index = tool,
+            Who::Helper => self.helper_cursor_index = tool,
+        }
+    }
+
+    // Lets the friend's hand hover, click objects and touch the crunchling like the player's own
+    async fn helper_pass<H: Host>(&mut self, ctx: &mut Ctx<H>) -> u32 {
+        let mut result = RESULT_CONTINUE;
+        let (hx, hy, down) = (ctx.session.helper.x, ctx.session.helper.y, ctx.session.helper.down);
+        if let Some(obj) = ctx.scene.probe(i32::from(hx), i32::from(hy)) {
+            ctx.scene.hover_hot_by_id(obj);
+            if obj == OBJ_K1 || obj == OBJ_K2 || obj == OBJ_K3 {
+                self.helper_cursor_index = ANIM_MOUSE_HAND;
+                let lid = match obj {
+                    OBJ_K1 => ANIM_BOX_1,
+                    OBJ_K2 => ANIM_BOX_2,
+                    _ => ANIM_BOX_3,
+                };
+                let h = self.anim(lid);
+                ctx.actors.set_anims(&ctx.av, ACTOR_BOX, h, h, false, STATE_STOPPED);
+            }
+            if down {
+                if !self.helper_latched {
+                    result = self.on_object_clicked(ctx, obj, Who::Helper).await;
+                    self.helper_latched = true;
+                }
+            } else {
+                self.helper_latched = false;
+            }
+        }
+        let crunchling = ctx.actors.get(ACTOR_CRUNCHLING);
+        let (hx, hy) = (i32::from(hx), i32::from(hy));
+        if crunchling.visible && crunchling.mouse_hittable && crunchling.anim.anim != NO_HANDLE {
+            let b = ctx.actors.bbox(&ctx.av, ACTOR_CRUNCHLING);
+            if b[0] <= hx && hx <= b[2] && b[1] <= hy && hy <= b[3] {
+                self.on_mouse_hit_at(ctx, hy, down, Who::Helper);
+            }
+        }
+        result
     }
 
     // Gives each of the seven actors its first animation, position, layer and visibility
@@ -1228,7 +1286,7 @@ impl HomeWorldScreen {
                 self.caster_y -= CASTER_STEP;
             }
         } else if CASTER_SHOWN_Y <= self.caster_y {
-            if ctx.av.is_key_down(KEY_SPACE) || ctx.av.is_stream_sound_done(self.voice_channel) {
+            if ctx.av.is_key_down(KEY_SPACE) || ctx.stream_done(self.voice_channel) {
                 ctx.av.kill_streaming_channel(self.voice_channel);
                 ctx.cursor.set_visible(true);
                 self.idle(ctx);
@@ -1334,6 +1392,8 @@ impl<H: Host> Screen<H> for HomeWorldScreen {
         ctx.cursor.set_anim(&ctx.av, self.anim(ANIM_MOUSE));
         ctx.cursor.set_visible(true);
         ctx.cursor.set_pos(0x140, 200);
+        self.helper_cursor.set_anim(&ctx.av, self.anim(ANIM_MOUSE_ONLINE));
+        self.helper_latched = false;
         if self.capn_sequence != SEQ_TRANSFORMED {
             self.crunchling_state = CL_IDLE;
         }
@@ -1367,6 +1427,7 @@ impl<H: Host> Screen<H> for HomeWorldScreen {
         let mut result = RESULT_CONTINUE;
         self.result = RESULT_CONTINUE;
         self.cursor_index = ANIM_MOUSE;
+        self.helper_cursor_index = ANIM_MOUSE;
         ctx.scene.draw_layer(&mut ctx.av, 0);
         if ctx.cursor.visible {
             let (dx, dy) = ctx.av.get_mouse_delta();
@@ -1388,7 +1449,7 @@ impl<H: Host> Screen<H> for HomeWorldScreen {
                 }
                 if ctx.av.is_mouse_button_down(MOUSE_LEFT) {
                     if !self.mouse_latched {
-                        result = self.on_object_clicked(ctx, obj).await;
+                        result = self.on_object_clicked(ctx, obj, Who::Primary).await;
                         self.mouse_latched = true;
                     }
                 } else {
@@ -1396,6 +1457,12 @@ impl<H: Host> Screen<H> for HomeWorldScreen {
                 }
             }
             ctx.actors.mouse_hit_test(&ctx.av, mx, my);
+            if ctx.session.helper_present() {
+                let helper_result = self.helper_pass(ctx).await;
+                if helper_result != RESULT_CONTINUE {
+                    result = helper_result;
+                }
+            }
         }
         self.cheat_keys(ctx);
         ctx.actors.update(&ctx.av);
@@ -1403,6 +1470,9 @@ impl<H: Host> Screen<H> for HomeWorldScreen {
             self.handle_event(ctx, ev.kind, ev.actor_id).await;
         }
         ctx.cursor.set_anim(&ctx.av, self.anim(self.cursor_index));
+        let helper_art = if self.helper_cursor_index == ANIM_MOUSE { ANIM_MOUSE_ONLINE } else { self.helper_cursor_index };
+        self.helper_cursor.set_anim(&ctx.av, self.anim(helper_art));
+        ctx.session.helper_art = self.anim(helper_art);
         ctx.actors.draw(&mut ctx.av, &ctx.scene, 2);
         ctx.scene.draw_layer(&mut ctx.av, 2);
         ctx.actors.draw(&mut ctx.av, &ctx.scene, 1);
@@ -1421,11 +1491,16 @@ impl<H: Host> Screen<H> for HomeWorldScreen {
             }
             ctx.player.lagging_stat = -1;
         }
-        if self.waiting_for_voice && ctx.av.is_stream_sound_done(self.voice_channel) {
+        if self.waiting_for_voice && ctx.stream_done(self.voice_channel) {
             self.waiting_for_voice = false;
             self.capn_sequence_step(ctx).await;
         }
         ctx.cursor.draw(&mut ctx.av);
+        if ctx.cursor.visible && ctx.session.helper_present() && !ctx.session.local_is_helper() {
+            self.helper_cursor.set_pos(ctx.session.helper.x, ctx.session.helper.y);
+            self.helper_cursor.set_visible(true);
+            self.helper_cursor.draw(&mut ctx.av);
+        }
         ctx.scene.advance_anims(&ctx.av);
         if self.result != RESULT_CONTINUE {
             result = self.result;

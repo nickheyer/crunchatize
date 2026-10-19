@@ -4,6 +4,7 @@ use crate::actors::ActorManager;
 use crate::av::Av;
 use crate::cursor::Cursor;
 use crate::host::Host;
+use crate::online::Session;
 use crate::player::PlayerData;
 use crate::scene::Scene;
 
@@ -44,7 +45,7 @@ pub struct Globals {
     pub debug_overlay: bool,
 }
 
-// Everything a screen touches, the engine plus the shared game objects and the host
+// Everything a screen touches, the engine plus the shared game objects, the host and the online session
 pub struct Ctx<H: Host> {
     pub av: Av,
     pub host: H,
@@ -54,6 +55,7 @@ pub struct Ctx<H: Host> {
     pub player: PlayerData,
     pub rand: Rand,
     pub globals: Globals,
+    pub session: Session,
 }
 
 impl<H: Host> Ctx<H> {
@@ -67,6 +69,7 @@ impl<H: Host> Ctx<H> {
             player: PlayerData::default(),
             rand: Rand::default(),
             globals: Globals::default(),
+            session: Session::new(),
         }
     }
 
@@ -75,8 +78,22 @@ impl<H: Host> Ctx<H> {
         self.rand.ranged(lo, n)
     }
 
+    // Clock the simulation sees, frozen for the whole tick and taken from the host's record when replaying
     pub fn time_ms(&self) -> u32 {
-        self.host.time_ms()
+        self.session.time_ms(self.host.time_ms())
+    }
+
+    // Whether a streamed voice finished, answered from the host's record when replaying
+    pub fn stream_done(&mut self, channel: u32) -> bool {
+        if let Some(done) = self.session.replay_bool() {
+            if done {
+                self.av.kill_streaming_channel(channel);
+            }
+            return done;
+        }
+        let done = self.av.is_stream_sound_done(channel);
+        self.session.record_bool(done);
+        done
     }
 }
 

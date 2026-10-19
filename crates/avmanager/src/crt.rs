@@ -18,6 +18,10 @@ impl Rand {
         self.seed = seed;
     }
 
+    pub fn state(&self) -> u32 {
+        self.seed
+    }
+
     // Linear congruential generator identical to msvcrt rand
     pub fn rand(&mut self) -> i32 {
         self.seed = self.seed.wrapping_mul(214013).wrapping_add(2531011);

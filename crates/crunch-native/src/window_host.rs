@@ -2,12 +2,13 @@ use std::time::Instant;
 
 use avmanager::input::DeviceState;
 use avmanager::sound::Sound;
-use crunch::host::Host;
+use crunch::host::{Host, NetEvent};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 
 use crate::audio::Audio;
 use crate::files::Files;
 use crate::keys::scan_code;
+use crate::net::NetClient;
 
 const WIDTH: usize = 640;
 const HEIGHT: usize = 480;
@@ -23,10 +24,12 @@ pub struct WindowHost {
     rgb: Vec<u32>,
     debug_toggle: bool,
     quit_requested: bool,
+    online: String,
+    net: Option<NetClient>,
 }
 
 impl WindowHost {
-    pub fn new(files: Files, audio: Audio, scale: usize) -> Result<Self, String> {
+    pub fn new(files: Files, audio: Audio, scale: usize, online: String) -> Result<Self, String> {
         let mut window = Window::new(
             "Crunchling Adventure",
             WIDTH * scale,
@@ -45,6 +48,8 @@ impl WindowHost {
             rgb: vec![0; WIDTH * HEIGHT * scale * scale],
             debug_toggle: false,
             quit_requested: false,
+            online,
+            net: None,
         })
     }
 
@@ -173,5 +178,23 @@ impl Host for WindowHost {
 
     fn log(&mut self, message: &str) {
         eprintln!("{message}");
+    }
+
+    fn net_connect(&mut self, path: &str) {
+        self.net = Some(NetClient::connect(format!("{}{path}", self.online)));
+    }
+
+    fn net_send(&mut self, data: &[u8]) {
+        if let Some(net) = &self.net {
+            net.send(data);
+        }
+    }
+
+    fn net_poll(&mut self) -> Option<NetEvent> {
+        self.net.as_ref()?.poll()
+    }
+
+    fn net_close(&mut self) {
+        self.net = None;
     }
 }

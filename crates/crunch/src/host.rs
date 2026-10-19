@@ -3,6 +3,14 @@ use std::future::Future;
 use avmanager::input::DeviceState;
 use avmanager::sound::Sound;
 
+// One thing the game server connection reported since the previous poll
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NetEvent {
+    Open,
+    Message(Vec<u8>),
+    Closed { code: u16, reason: String },
+}
+
 // Everything the game needs from the machine it runs on, supplied by a native or web shell
 pub trait Host {
     // Reads a data file by name, matching the name without regard to letter case
@@ -43,4 +51,14 @@ pub trait Host {
     fn show_credits(&mut self, shown: bool) -> bool;
 
     fn log(&mut self, message: &str);
+
+    // Opens a WebSocket to a game server path such as /online/host, dropping any earlier connection
+    fn net_connect(&mut self, path: &str);
+
+    fn net_send(&mut self, data: &[u8]);
+
+    // Next event of the current connection in arrival order, None when nothing new happened
+    fn net_poll(&mut self) -> Option<NetEvent>;
+
+    fn net_close(&mut self);
 }

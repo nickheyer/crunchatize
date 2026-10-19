@@ -2,19 +2,21 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-// Case insensitive view of the game data folder and the save folder
+// Case insensitive view of the game data folders, later ones overriding, and the save folder
 pub struct Files {
     data: HashMap<String, PathBuf>,
     saves: PathBuf,
 }
 
 impl Files {
-    pub fn new(data_dir: &Path, saves_dir: &Path) -> std::io::Result<Self> {
+    pub fn new(data_dirs: &[PathBuf], saves_dir: &Path) -> std::io::Result<Self> {
         let mut data = HashMap::new();
-        for entry in fs::read_dir(data_dir)? {
-            let entry = entry?;
-            if entry.file_type()?.is_file() {
-                data.insert(entry.file_name().to_string_lossy().to_lowercase(), entry.path());
+        for dir in data_dirs {
+            for entry in fs::read_dir(dir)? {
+                let entry = entry?;
+                if entry.file_type()?.is_file() {
+                    data.insert(entry.file_name().to_string_lossy().to_lowercase(), entry.path());
+                }
             }
         }
         fs::create_dir_all(saves_dir)?;

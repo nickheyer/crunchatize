@@ -201,7 +201,7 @@ impl<H: Host> Screen<H> for ChallengeScreen {
                 ret = STATE_HOME_WORLD;
             }
         } else if self.dialogue_state == 1 {
-            if ctx.av.is_stream_sound_done(self.voice) {
+            if ctx.stream_done(self.voice) {
                 let idle = self.anims[ANIM_CAPN_IDLE];
                 ctx.actors.set_anims(&ctx.av, ACTOR_CAPN, idle, idle, false, STATE_RESTART_FORWARD);
                 let talk = self.anims[ANIM_THIEF_TALK];
@@ -210,14 +210,14 @@ impl<H: Host> Screen<H> for ChallengeScreen {
                 self.dialogue_state = 2;
             }
         } else if self.dialogue_state == 2 {
-            if ctx.av.is_stream_sound_done(self.voice) {
+            if ctx.stream_done(self.voice) {
                 let stance = self.anims[ANIM_THIEF_STANCE];
                 ctx.actors.set_anims(&ctx.av, ACTOR_THIEF, stance, stance, false, STATE_RESTART_FORWARD);
                 ctx.actors.set_timer(ACTOR_CAPN, SPEAKER_DELAY);
                 self.dialogue_state = 3;
             }
         } else if self.dialogue_state == 4 {
-            if ctx.av.is_stream_sound_done(self.voice) {
+            if ctx.stream_done(self.voice) {
                 if !self.after_loss {
                     let talk = self.anims[ANIM_CAPN_TALK_B];
                     ctx.actors.set_anims(&ctx.av, ACTOR_CAPN, talk, talk, false, STATE_RESTART_FORWARD);
@@ -235,7 +235,7 @@ impl<H: Host> Screen<H> for ChallengeScreen {
                 }
                 self.dialogue_state = 5;
             }
-        } else if self.dialogue_state == 5 && ctx.av.is_stream_sound_done(self.voice) {
+        } else if self.dialogue_state == 5 && ctx.stream_done(self.voice) {
             let idle = self.anims[ANIM_CAPN_IDLE];
             ctx.actors.set_anims(&ctx.av, ACTOR_CAPN, idle, idle, false, STATE_RESTART_FORWARD);
             ctx.actors.set_timer(ACTOR_CAPN, SPEAKER_DELAY);

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::Path;
 use std::pin::pin;
@@ -8,7 +8,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use avmanager::input::DeviceState;
 use avmanager::sound::Sound;
 use crunch::av::Av;
-use crunch::host::Host;
+use crunch::host::{Host, NetEvent};
 use crunch::scene::{KIND_TEXT, Scene};
 
 const DATA_DIR: &str = "/home/nick/code/crunchatize/dev/disc/iso/CrunchData";
@@ -34,6 +34,7 @@ fn block_on<F: Future>(fut: F) -> F::Output {
 struct DirHost {
     files: HashMap<String, std::path::PathBuf>,
     frames: usize,
+    net: VecDeque<NetEvent>,
 }
 
 impl DirHost {
@@ -42,7 +43,7 @@ impl DirHost {
         for e in std::fs::read_dir(dir).unwrap().flatten() {
             files.insert(e.file_name().to_string_lossy().to_lowercase(), e.path());
         }
-        Self { files, frames: 0 }
+        Self { files, frames: 0, net: VecDeque::new() }
     }
 }
 
@@ -102,6 +103,19 @@ impl Host for DirHost {
     fn log(&mut self, message: &str) {
         eprintln!("{message}");
     }
+
+
+    fn net_connect(&mut self, _path: &str) {
+        self.net.push_back(NetEvent::Closed { code: 1006, reason: "no network in this test".into() });
+    }
+
+    fn net_send(&mut self, _data: &[u8]) {}
+
+    fn net_poll(&mut self) -> Option<NetEvent> {
+        self.net.pop_front()
+    }
+
+    fn net_close(&mut self) {}
 }
 
 const GAME_SCENES: [&str; 13] = [

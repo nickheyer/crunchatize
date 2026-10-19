@@ -3,20 +3,20 @@
 mod keys;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use avmanager::input::DeviceState;
 use avmanager::sound::Sound;
-use crunch::host::Host;
+use crunch::host::{Host, NetEvent};
 use crunch_pak::Index;
 use js_sys::{Array, Float32Array, Function, Promise, Reflect, Uint8Array};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
-    AudioContext, AudioContextOptions, AudioContextState, AudioWorkletNode, AudioWorkletNodeOptions, Cache,
-    CanvasRenderingContext2d, HtmlCanvasElement, HtmlElement, ImageData, KeyboardEvent, PointerEvent, ReadableStreamDefaultReader,
-    ReadableStreamReadResult, Request, Response, Url, Window,
+    AudioContext, AudioContextOptions, AudioContextState, AudioWorkletNode, AudioWorkletNodeOptions, BinaryType, Cache,
+    CanvasRenderingContext2d, CloseEvent, HtmlCanvasElement, HtmlElement, ImageData, KeyboardEvent, MessageEvent,
+    PointerEvent, ReadableStreamDefaultReader, ReadableStreamReadResult, Request, Response, Url, WebSocket, Window,
 };
 
 const WIDTH: u32 = 640;
@@ -29,6 +29,7 @@ const GESTURE_EVENTS: [&str; 4] = ["pointerdown", "pointerup", "keydown", "touch
 const PACK: &str = "crunch.pak";
 const CACHE_NAME: &str = "crunch";
 const BAR_WIDTH: f64 = 400.0;
+const CLOSE_ABNORMAL: u16 = 1006;
 
 // Input gathered by browser event listeners between game ticks
 #[derive(Default)]
@@ -46,6 +47,51 @@ struct AudioOut {
 }
 
 type SharedAudio = Rc<RefCell<Option<AudioOut>>>;
+
+type NetQueue = Rc<RefCell<VecDeque<(u32, NetEvent)>>>;
+
+// The socket to the game server with the listeners that feed its events into the shared queue
+struct NetLink {
+    socket: WebSocket,
+    _callbacks: Vec<Closure<dyn FnMut(JsValue)>>,
+}
+
+impl Drop for NetLink {
+    fn drop(&mut self) {
+        let _ = self.socket.close();
+    }
+}
+
+// Opens a socket whose events carry the given connection id
+fn open_socket(url: &str, id: u32, queue: &NetQueue) -> Result<NetLink, JsValue> {
+    let socket = WebSocket::new(url)?;
+    socket.set_binary_type(BinaryType::Arraybuffer);
+    let mut callbacks = Vec::new();
+    let q = queue.clone();
+    let on_open = Closure::<dyn FnMut(JsValue)>::new(move |_| q.borrow_mut().push_back((id, NetEvent::Open)));
+    socket.set_onopen(Some(on_open.as_ref().unchecked_ref()));
+    callbacks.push(on_open);
+    let q = queue.clone();
+    let on_message = Closure::<dyn FnMut(JsValue)>::new(move |e: JsValue| {
+        let Ok(e) = e.dyn_into::<MessageEvent>() else { return };
+        let Ok(buffer) = e.data().dyn_into::<js_sys::ArrayBuffer>() else { return };
+        let bytes = Uint8Array::new(&buffer).to_vec();
+        q.borrow_mut().push_back((id, NetEvent::Message(bytes)));
+    });
+    socket.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+    callbacks.push(on_message);
+    let q = queue.clone();
+    let on_close = Closure::<dyn FnMut(JsValue)>::new(move |e: JsValue| {
+        let (code, reason) = match e.dyn_into::<CloseEvent>() {
+            Ok(e) => (e.code(), e.reason()),
+            Err(_) => (CLOSE_ABNORMAL, String::new()),
+        };
+        q.borrow_mut().push_back((id, NetEvent::Closed { code, reason }));
+    });
+    socket.set_onclose(Some(on_close.as_ref().unchecked_ref()));
+    callbacks.push(on_close);
+    Ok(NetLink { socket, _callbacks: callbacks })
+}
 
 // The whole data pack held in memory with its parsed index
 struct Pack {
@@ -81,6 +127,10 @@ pub struct WebHost {
     last_feed_ms: f64,
     input: Rc<RefCell<InputState>>,
     start: f64,
+    online_url: String,
+    net_queue: NetQueue,
+    net_id: u32,
+    net: Option<NetLink>,
 }
 
 fn now_ms() -> f64 {
@@ -263,6 +313,42 @@ impl Host for WebHost {
 
     fn log(&mut self, message: &str) {
         web_sys::console::log_1(&message.into());
+    }
+
+    fn net_connect(&mut self, path: &str) {
+        self.net = None;
+        self.net_id += 1;
+        let url = format!("{}{path}", self.online_url);
+        match open_socket(&url, self.net_id, &self.net_queue) {
+            Ok(link) => self.net = Some(link),
+            Err(e) => {
+                let id = self.net_id;
+                self.net_queue.borrow_mut().push_back((id, NetEvent::Closed { code: CLOSE_ABNORMAL, reason: describe(&e) }));
+            }
+        }
+    }
+
+    fn net_send(&mut self, data: &[u8]) {
+        if let Some(link) = &self.net
+            && let Err(e) = link.socket.send_with_u8_array(data)
+        {
+            web_sys::console::warn_1(&e);
+        }
+    }
+
+    fn net_poll(&mut self) -> Option<NetEvent> {
+        let mut queue = self.net_queue.borrow_mut();
+        while let Some((id, event)) = queue.pop_front() {
+            if id == self.net_id {
+                return Some(event);
+            }
+        }
+        None
+    }
+
+    fn net_close(&mut self) {
+        self.net = None;
+        self.net_id += 1;
     }
 }
 
@@ -537,6 +623,15 @@ fn attach_input(canvas: &HtmlCanvasElement, input: Rc<RefCell<InputState>>) {
     on_up.forget();
 }
 
+// WebSocket origin of the page, the game server living beside the data pack
+fn online_url(window: &Window) -> Result<String, JsValue> {
+    let origin = window.location().origin()?;
+    Ok(match origin.strip_prefix("https://") {
+        Some(rest) => format!("wss://{rest}"),
+        None => format!("ws://{}", origin.strip_prefix("http://").unwrap_or(&origin)),
+    })
+}
+
 // Boots the game on a canvas after loading the pack version the data URL currently serves
 #[wasm_bindgen]
 pub async fn start(
@@ -547,6 +642,7 @@ pub async fn start(
 ) -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
     let window = web_sys::window().ok_or("no window")?;
+    let online = online_url(&window)?;
     canvas.set_width(WIDTH);
     canvas.set_height(HEIGHT);
     let ctx2d: CanvasRenderingContext2d = canvas
@@ -579,6 +675,10 @@ pub async fn start(
         last_feed_ms: now_ms(),
         input,
         start: now_ms(),
+        online_url: online,
+        net_queue: Rc::new(RefCell::new(VecDeque::new())),
+        net_id: 0,
+        net: None,
     };
     let _ = host.canvas.focus();
     crunch::game::run(host, OUT_RATE).await;

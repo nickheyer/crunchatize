@@ -1,12 +1,15 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use avmanager::input::DeviceState;
 use avmanager::sound::Sound;
-use crunch::host::Host;
+use crunch::host::{Host, NetEvent};
 
 use crate::files::Files;
+use crate::net::NetClient;
 
 const WIDTH: usize = 640;
 const HEIGHT: usize = 480;
@@ -89,9 +92,10 @@ fn parse_script(text: &str) -> Result<HashMap<u64, ScriptLine>, String> {
     Ok(out)
 }
 
-// Deterministic shell with a virtual clock, scripted input and frame dumps
+// Deterministic shell with a virtual clock, scripted input and frame dumps, paced to real time on request
 pub struct HeadlessHost {
     files: Files,
+    pace: Option<Instant>,
     script: HashMap<u64, ScriptLine>,
     out_dir: Option<PathBuf>,
     dump_every: u64,
@@ -102,9 +106,12 @@ pub struct HeadlessHost {
     seed: u32,
     wav_path: Option<PathBuf>,
     samples: Vec<i16>,
+    online: String,
+    net: Option<NetClient>,
 }
 
 impl HeadlessHost {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         files: Files,
         script_path: Option<&Path>,
@@ -113,6 +120,8 @@ impl HeadlessHost {
         max_ticks: u64,
         seed: u32,
         wav_path: Option<PathBuf>,
+        online: String,
+        pace: bool,
     ) -> Result<Self, String> {
         let script = match script_path {
             Some(p) => parse_script(&fs::read_to_string(p).map_err(|e| e.to_string())?)?,
@@ -123,6 +132,7 @@ impl HeadlessHost {
         }
         Ok(Self {
             files,
+            pace: pace.then(Instant::now),
             script,
             out_dir,
             dump_every: dump_every.max(1),
@@ -133,6 +143,8 @@ impl HeadlessHost {
             seed,
             wav_path,
             samples: Vec::new(),
+            online,
+            net: None,
         })
     }
 
@@ -222,6 +234,12 @@ impl Host for HeadlessHost {
             self.samples.extend_from_slice(&buf);
         }
         self.clock_ms = self.clock_ms.wrapping_add(STEP_MS);
+        if let Some(start) = self.pace {
+            let due = start + Duration::from_millis(u64::from(self.clock_ms));
+            if let Some(wait) = due.checked_duration_since(Instant::now()) {
+                thread::sleep(wait);
+            }
+        }
     }
 
     fn list_saves(&mut self) -> Vec<String> {
@@ -262,6 +280,24 @@ impl Host for HeadlessHost {
 
     fn log(&mut self, message: &str) {
         eprintln!("{message}");
+    }
+
+    fn net_connect(&mut self, path: &str) {
+        self.net = Some(NetClient::connect(format!("{}{path}", self.online)));
+    }
+
+    fn net_send(&mut self, data: &[u8]) {
+        if let Some(net) = &self.net {
+            net.send(data);
+        }
+    }
+
+    fn net_poll(&mut self) -> Option<NetEvent> {
+        self.net.as_ref()?.poll()
+    }
+
+    fn net_close(&mut self) {
+        self.net = None;
     }
 }
 

@@ -319,16 +319,20 @@ mod tests {
     use std::pin::pin;
     use std::task::{Context as TaskContext, Poll, Waker};
 
+    use std::collections::VecDeque;
+
     use avmanager::input::DeviceState;
     use avmanager::sound::Sound;
 
     use super::*;
+    use crate::host::NetEvent;
     use crate::player::encode_save;
 
     // In memory save directory that also records every data file the game asked for
     struct SaveHost {
         files: Vec<(String, Vec<u8>)>,
         reads: Vec<String>,
+        net: VecDeque<NetEvent>,
     }
 
     impl Host for SaveHost {
@@ -387,6 +391,18 @@ mod tests {
         }
 
         fn log(&mut self, _message: &str) {}
+
+        fn net_connect(&mut self, _path: &str) {
+            self.net.push_back(NetEvent::Closed { code: 1006, reason: "no network in this test".into() });
+        }
+
+        fn net_send(&mut self, _data: &[u8]) {}
+
+        fn net_poll(&mut self) -> Option<NetEvent> {
+            self.net.pop_front()
+        }
+
+        fn net_close(&mut self) {}
     }
 
     fn block_on<F: Future>(fut: F) -> F::Output {
@@ -406,7 +422,7 @@ mod tests {
     }
 
     fn ctx_with_saves(files: Vec<(String, Vec<u8>)>) -> Ctx<SaveHost> {
-        Ctx::new(SaveHost { files, reads: Vec::new() }, 22050)
+        Ctx::new(SaveHost { files, reads: Vec::new(), net: VecDeque::new() }, 22050)
     }
 
     #[test]

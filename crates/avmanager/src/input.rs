@@ -42,7 +42,7 @@ const KEY_NAMES: [&str; 0x68] = [
 ];
 
 // Raw device state the host samples once per tick, pointer set by hosts that know the absolute mouse spot
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceState {
     pub scan_keys: [bool; 256],
     pub mouse_dx: i32,

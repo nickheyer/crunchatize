@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::Path;
 use std::pin::pin;
@@ -12,10 +12,11 @@ use crunch::ctx::{
     STATE_RUNNING, STATE_THROWING, STATE_TITLE,
 };
 use crunch::game::Game;
-use crunch::host::Host;
+use crunch::host::{Host, NetEvent};
 use crunch::player::{PlayerData, encode_save};
 
 const DATA_DIR: &str = "/home/nick/code/crunchatize/dev/disc/iso/CrunchData";
+const ASSETS_DIR: &str = "/home/nick/code/crunchatize/assets";
 const TICK_MS: u32 = 33;
 
 struct NoopWake;
@@ -35,22 +36,25 @@ fn block_on<F: Future>(fut: F) -> F::Output {
     }
 }
 
-// Disc backed host with a virtual clock, in memory saves and a count of lit frames
+// Disc and assets backed host with a virtual clock, in memory saves and a count of lit frames
 struct SmokeHost {
     files: HashMap<String, std::path::PathBuf>,
     saves: Vec<(String, Vec<u8>)>,
     clock: u32,
     lit_frames: usize,
     frames: usize,
+    net: VecDeque<NetEvent>,
 }
 
 impl SmokeHost {
-    fn new(dir: &Path) -> Self {
+    fn new(dirs: &[&Path]) -> Self {
         let mut files = HashMap::new();
-        for e in std::fs::read_dir(dir).unwrap().flatten() {
-            files.insert(e.file_name().to_string_lossy().to_lowercase(), e.path());
+        for dir in dirs {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                files.insert(e.file_name().to_string_lossy().to_lowercase(), e.path());
+            }
         }
-        Self { files, saves: Vec::new(), clock: 0, lit_frames: 0, frames: 0 }
+        Self { files, saves: Vec::new(), clock: 0, lit_frames: 0, frames: 0, net: VecDeque::new() }
     }
 }
 
@@ -122,6 +126,19 @@ impl Host for SmokeHost {
     fn log(&mut self, message: &str) {
         eprintln!("{message}");
     }
+
+
+    fn net_connect(&mut self, _path: &str) {
+        self.net.push_back(NetEvent::Closed { code: 1006, reason: "no network in this test".into() });
+    }
+
+    fn net_send(&mut self, _data: &[u8]) {}
+
+    fn net_poll(&mut self) -> Option<NetEvent> {
+        self.net.pop_front()
+    }
+
+    fn net_close(&mut self) {}
 }
 
 fn player(stage: u16, kind: i16) -> PlayerData {
@@ -140,8 +157,7 @@ fn player(stage: u16, kind: i16) -> PlayerData {
 
 // Boots a state and runs ticks, returning the number of frames with any lit pixel
 fn boot_and_run(state: u32, p: PlayerData, ticks: usize) -> usize {
-    let dir = Path::new(DATA_DIR);
-    let mut host = SmokeHost::new(dir);
+    let mut host = SmokeHost::new(&[Path::new(DATA_DIR), Path::new(ASSETS_DIR)]);
     host.saves.push(("Player_1.crn".to_string(), encode_save(&p)));
     let mut ctx = Ctx::new(host, 44100);
     ctx.player = p;

@@ -474,7 +474,7 @@ impl ThrowScreen {
                     }
                 }
                 if self.challenge_phase == PHASE_NORMAL {
-                    let now = ctx.host.time_ms();
+                    let now = ctx.time_ms();
                     let mut dt = now.wrapping_sub(self.last_time_ms) as f32;
                     if self.first_tick {
                         dt = 0.0;
@@ -520,7 +520,7 @@ impl ThrowScreen {
                 self.capn_state = CAPN_TV_TALKING;
                 self.voice = ctx.av.play_stream_sound(&mut ctx.host, "049.wav", false, self.voice).await;
                 self.challenge_phase += 1;
-            } else if ctx.av.is_stream_sound_done(self.voice) {
+            } else if ctx.stream_done(self.voice) {
                 self.challenge_phase += 1;
             }
             if self.countdown == COUNTDOWN_GO {
@@ -549,11 +549,11 @@ impl ThrowScreen {
             ctx.actors.set_timer(ACTOR_CAPN, 0);
             self.capn_state = CAPN_SKIPPED;
             self.intro_active = false;
-        } else if self.intro_waiting_voice && ctx.av.is_stream_sound_done(self.voice) {
+        } else if self.intro_waiting_voice && ctx.stream_done(self.voice) {
             self.intro_waiting_voice = false;
             self.advance_intro(ctx).await;
         }
-        if self.capn_state == CAPN_TV_TALKING && ctx.av.is_stream_sound_done(self.voice) {
+        if self.capn_state == CAPN_TV_TALKING && ctx.stream_done(self.voice) {
             self.capn_state = CAPN_TV_IDLE;
             set_actor_anim(ctx, ACTOR_CAPN, self.anims[A_CAP_TV_005], false, STATE_RESTART_FORWARD);
         }

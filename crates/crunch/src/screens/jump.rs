@@ -510,7 +510,7 @@ impl JumpScreen {
             }
             ctx.actors.set_x(ACTOR_PLAYER, x);
         }
-        let now = ctx.host.time_ms();
+        let now = ctx.time_ms();
         let mut dt = now.wrapping_sub(self.last_time) as f32;
         if self.timer_reset {
             dt = 0.0;
@@ -539,7 +539,7 @@ impl JumpScreen {
             ctx.actors.set_anims(&ctx.av, ACTOR_CAPN, talk, talk, false, STATE_RESTART_FORWARD);
             self.voice = ctx.av.play_stream_sound(&mut ctx.host, "049.wav", false, self.voice).await;
             self.challenge += 1;
-        } else if ctx.av.is_stream_sound_done(self.voice) {
+        } else if ctx.stream_done(self.voice) {
             self.challenge += 1;
         }
         if self.countdown == COUNTDOWN_ACTIVE {
@@ -590,7 +590,7 @@ impl JumpScreen {
             if !arrived {
                 self.fly_y += speed;
             }
-        } else if self.capn_fly_state == FLY_SPEAKING && ctx.av.is_stream_sound_done(self.voice) {
+        } else if self.capn_fly_state == FLY_SPEAKING && ctx.stream_done(self.voice) {
             let idle = self.anims[ANIM_CAPN_FLY_IDLE];
             ctx.actors.set_anims(&ctx.av, ACTOR_CAPN, idle, idle, false, STATE_RESTART_FORWARD);
             self.capn_fly_state = FLY_LEAVING;
@@ -653,7 +653,7 @@ impl JumpScreen {
                     self.fly_y += 6.0;
                 }
             }
-            FLY_SPEAKING if ctx.av.is_stream_sound_done(self.voice) => {
+            FLY_SPEAKING if ctx.stream_done(self.voice) => {
                 let idle = self.anims[ANIM_CAPN_FLY_IDLE];
                 ctx.actors.set_anims(&ctx.av, ACTOR_CAPN, idle, idle, false, STATE_RESTART_FORWARD);
                 self.capn_fly_state = FLY_LEAVING;
@@ -822,7 +822,7 @@ impl<H: Host> Screen<H> for JumpScreen {
         if self.outro_active {
             self.update_outro(ctx).await;
         }
-        if self.capn_state == CAPN_TALKING && ctx.av.is_stream_sound_done(self.voice) {
+        if self.capn_state == CAPN_TALKING && ctx.stream_done(self.voice) {
             self.capn_state = CAPN_IDLE;
             let idle = self.anims[ANIM_CAP_TV_IDLE];
             ctx.actors.set_anims(&ctx.av, ACTOR_CAPN, idle, idle, false, STATE_RESTART_FORWARD);

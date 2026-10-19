@@ -512,7 +512,7 @@ impl<H: Host> Screen<H> for CreateScreen {
             }
             ctx.scene.set_text_cursor_by_id(ID_NAME, if self.blink > 0xb { 2 } else { 1 });
         }
-        if self.speech != 0 && ctx.av.is_stream_sound_done(self.speech) {
+        if self.speech != 0 && ctx.stream_done(self.speech) {
             self.speech = 0;
             ctx.actors.set_visible(SPRITE_CAPTAIN, false);
             if self.done {
@@ -587,7 +587,7 @@ fn accepts_name_char(c: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::path::Path;
     use std::pin::pin;
     use std::task::{Context, Poll, Waker};
@@ -596,6 +596,7 @@ mod tests {
     use avmanager::sound::{INVALID_HANDLE, Sound};
 
     use super::*;
+    use crate::host::NetEvent;
 
     const DATA_DIR: &str = "/home/nick/code/crunchatize/dev/disc/iso/CrunchData";
     const SCAN_ESC: usize = 1;
@@ -614,6 +615,7 @@ mod tests {
         ticks: u32,
         device: DeviceState,
         saves: HashMap<String, Vec<u8>>,
+        net: VecDeque<NetEvent>,
     }
 
     impl Host for DiscHost {
@@ -680,6 +682,19 @@ mod tests {
         }
 
         fn log(&mut self, _message: &str) {}
+
+
+        fn net_connect(&mut self, _path: &str) {
+            self.net.push_back(NetEvent::Closed { code: 1006, reason: "no network in this test".into() });
+        }
+
+        fn net_send(&mut self, _data: &[u8]) {}
+
+        fn net_poll(&mut self) -> Option<NetEvent> {
+            self.net.pop_front()
+        }
+
+        fn net_close(&mut self) {}
     }
 
     fn block_on<F: Future>(fut: F) -> F::Output {

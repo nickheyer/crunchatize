@@ -26,29 +26,33 @@ fn invalid(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-// Lists the regular files of a folder by lower case name, rejecting names that collide or break the index
-fn list_files(dir: &Path) -> io::Result<BTreeMap<String, (PathBuf, u64)>> {
+// Lists the regular files of the folders by lower case name, later folders replacing earlier files
+fn list_files(dirs: &[&Path]) -> io::Result<BTreeMap<String, (PathBuf, u64)>> {
     let mut files = BTreeMap::new();
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
+    for dir in dirs {
+        let mut here = BTreeMap::new();
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            if name.contains(['\t', '\n']) {
+                return Err(invalid(format!("{name:?} contains a tab or newline")));
+            }
+            let size = entry.metadata()?.len();
+            if here.insert(name.clone(), (entry.path(), size)).is_some() {
+                return Err(invalid(format!("{name} appears twice ignoring case")));
+            }
         }
-        let name = entry.file_name().to_string_lossy().to_lowercase();
-        if name.contains(['\t', '\n']) {
-            return Err(invalid(format!("{name:?} contains a tab or newline")));
-        }
-        let size = entry.metadata()?.len();
-        if files.insert(name.clone(), (entry.path(), size)).is_some() {
-            return Err(invalid(format!("{name} appears twice ignoring case")));
-        }
+        files.extend(here);
     }
     Ok(files)
 }
 
 // Writes the magic, index and every file body in name order, returning the file count
-pub fn pack_to(dir: &Path, out: &mut impl Write) -> io::Result<usize> {
-    let files = list_files(dir)?;
+pub fn pack_to(dirs: &[&Path], out: &mut impl Write) -> io::Result<usize> {
+    let files = list_files(dirs)?;
     let mut index = String::new();
     let mut offset = 0u64;
     for (name, (_, size)) in &files {
@@ -111,7 +115,7 @@ mod tests {
         fs::write(dir.join("001.wav"), b"wav").unwrap();
         fs::create_dir(dir.join("sub")).unwrap();
         let mut pack = Vec::new();
-        assert_eq!(pack_to(&dir, &mut pack).unwrap(), 2);
+        assert_eq!(pack_to(&[dir.as_path()], &mut pack).unwrap(), 2);
         let index = read_index(&mut pack.as_slice()).unwrap();
         let names: Vec<&String> = index.files.keys().collect();
         assert_eq!(names, ["001.wav", "mouse.bam"]);
@@ -130,9 +134,26 @@ mod tests {
         let dir = scratch_dir("collide");
         fs::write(dir.join("a.wav"), b"1").unwrap();
         fs::write(dir.join("A.WAV"), b"2").unwrap();
-        let err = pack_to(&dir, &mut Vec::new()).unwrap_err();
+        let err = pack_to(&[dir.as_path()], &mut Vec::new()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn later_folders_replace_earlier_files() {
+        let base = scratch_dir("base");
+        let extra = scratch_dir("extra");
+        fs::write(base.join("a.wav"), b"old").unwrap();
+        fs::write(base.join("b.wav"), b"keep").unwrap();
+        fs::write(extra.join("A.WAV"), b"new!").unwrap();
+        let mut pack = Vec::new();
+        assert_eq!(pack_to(&[base.as_path(), extra.as_path()], &mut pack).unwrap(), 2);
+        let index = read_index(&mut pack.as_slice()).unwrap();
+        let a = index.files["a.wav"];
+        let body = &pack[index.body_start as usize..];
+        assert_eq!(&body[a.offset as usize..][..a.size as usize], b"new!");
+        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(extra).unwrap();
     }
 
     #[test]

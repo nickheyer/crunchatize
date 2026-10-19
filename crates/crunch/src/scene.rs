@@ -498,6 +498,30 @@ impl Scene {
         }
     }
 
+    // Reports the topmost interactive object under a screen point without touching hover states
+    pub fn probe(&self, x: i32, y: i32) -> Option<i32> {
+        self.objects.iter().rev().find_map(|o| {
+            if o.state == 0 || o.id == 0 || o.hover == HOVER_HIDDEN {
+                return None;
+            }
+            let (px, py) = if o.flags & FLAG_SCREEN_FIXED != 0 { (x, y) } else { (x + self.scroll_x, y + self.scroll_y) };
+            let inside = px >= o.bbox_x1 && px <= o.bbox_x2 && py >= o.bbox_y1 && py <= o.bbox_y2;
+            inside.then_some(o.id)
+        })
+    }
+
+    // Lights an object the way the cursor resting on it would
+    pub fn hover_hot_by_id(&mut self, id: i32) {
+        if let Some(i) = self.index_of_id(id) {
+            let o = &mut self.objects[i];
+            if o.hover == HOVER_NORMAL {
+                o.hover = HOVER_HOT;
+            } else if o.hover == HOVER_PRESSED {
+                o.hover = HOVER_PRESSED_HOT;
+            }
+        }
+    }
+
     // Reports the topmost interactive object under a screen point and updates hover states
     pub fn hit_test(&mut self, x: i32, y: i32) -> Option<i32> {
         let raw_x = x;

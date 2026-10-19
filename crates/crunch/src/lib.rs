@@ -4,6 +4,7 @@ pub mod actors;
 pub mod av;
 pub mod cursor;
 pub mod host;
+pub mod online;
 pub mod player;
 pub mod scene;
 pub mod scroll_strip;
