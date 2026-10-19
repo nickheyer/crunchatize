@@ -36,6 +36,9 @@ pub fn state_hash<H: Host>(ctx: &Ctx<H>, state: u32) -> u32 {
     let mut d = Digest(FNV_OFFSET);
     d.u32(state);
     d.bytes(&ctx.player.to_bytes());
+    if let Some(guest) = ctx.session.guest() {
+        d.bytes(&guest.to_bytes());
+    }
     d.u32(ctx.rand.state());
     d.i32(i32::from(ctx.cursor.x));
     d.i32(i32::from(ctx.cursor.y));

@@ -1,27 +1,18 @@
 use avmanager::anim::{STATE_RESTART_FORWARD, STATE_STOPPED};
 use avmanager::crt::ftol;
 use avmanager::sound::INVALID_HANDLE;
-use avmanager::texture::Palette24;
 
-use crate::actors::{EVENT_ANIM_END, EVENT_GROUND_REACHED, EVENT_INIT_OBJECT, FACING_NONE};
+use crate::actors::{EVENT_ANIM_END, EVENT_GROUND_REACHED, EVENT_INIT_OBJECT, FACING_NONE, NO_HANDLE};
 use crate::ctx::{
-    Ctx, KEY_ESC, KEY_LEFT, KEY_RIGHT, KEY_SPACE, MOUSE_LEFT, RESULT_CONTINUE, STATE_CHALLENGE, STATE_HOME_WORLD,
-    STATE_RUNNING, Screen,
+    Ctx, Held, KEY_ESC, KEY_SPACE, MOUSE_LEFT, RESULT_CONTINUE, STATE_CHALLENGE, STATE_HOME_WORLD, STATE_RUNNING,
+    Screen,
 };
 use crate::host::Host;
+use crate::online::wins_text;
 use crate::scene::{HOVER_HIDDEN, HOVER_NORMAL, LAYER_ALL};
 use crate::scroll_strip::ScrollStrip;
+use crate::skin::Skin;
 
-const A_CHECK_PADS: usize = 0;
-const A_SKATING: usize = 1;
-const A_JUMP: usize = 2;
-const A_CRASH: usize = 3;
-const A_GETUP: usize = 4;
-const A_VICTORY: usize = 5;
-const A_GOTO_DEFEAT: usize = 6;
-const A_DEFEAT: usize = 7;
-const A_SPIN: usize = 8;
-const A_STRETCH: usize = 9;
 const A_OPP_RUN: usize = 10;
 const A_OPP_WAIT: usize = 11;
 const A_OPP_VICTORY: usize = 12;
@@ -49,8 +40,19 @@ const A_LINE: usize = 35;
 const A_PLATFORM: usize = 36;
 const A_BARRICADE: usize = 37;
 const A_BARRICADE_ANIM: usize = 38;
-const A_ADULT_BBOX: usize = 39;
-const ANIM_COUNT: usize = 40;
+const ANIM_COUNT: usize = 39;
+
+// Handle table of one skater's own crunchling animations
+const SK_SKATING: usize = 0;
+const SK_JUMP: usize = 1;
+const SK_CRASH: usize = 2;
+const SK_GETUP: usize = 3;
+const SK_VICTORY: usize = 4;
+const SK_GOTO_DEFEAT: usize = 5;
+const SK_DEFEAT: usize = 6;
+const SK_SPIN: usize = 7;
+const SK_STRETCH: usize = 8;
+const SK_COUNT: usize = 9;
 
 const SFX_LOOP: usize = 0;
 const SFX_JUMP: usize = 1;
@@ -65,7 +67,6 @@ const ACTOR_CAR: i32 = 2;
 const ACTOR_CAPN: i32 = 3;
 const ACTOR_SIGN: i32 = 0xc;
 
-const PS_PRE_INIT: i32 = 0;
 const PS_SKATING: i32 = 1;
 const PS_RIDING: i32 = 2;
 const PS_AIRBORNE: i32 = 3;
@@ -98,6 +99,20 @@ const LAYER_MAIN: u32 = 1;
 const LAYER_FRONT: u32 = 4;
 const LAYER_TOP: u32 = 8;
 
+const ACCEL: f32 = 0.6;
+const BRAKE: f32 = 0.7;
+const OBJ_BERRIES: i32 = 1;
+const OBJ_TIME: i32 = 2;
+const OBJ_GOOD_JOB: i32 = 7;
+
+// Friend match camera, the midpoint of both skaters drawn here and a lead this long ending the race
+const VERSUS_CENTER: f32 = 280.0;
+const VERSUS_GAP_LIMIT: f32 = 520.0;
+const VERSUS_SPAWN_X: f32 = 900.0;
+const VERSUS_RIVAL_DEPTH: f32 = 8.0;
+const LINE_SCREEN_X: f32 = 700.0;
+const CROSS_PAST: f32 = 60.0;
+
 // Table at 0x00429d08 indexed by anim_index, draw offset dx and dy then the platform ride y shift
 const PLAYER_OFFSETS: [[i32; 3]; 9] = [
     [0, 11, 22],
@@ -122,18 +137,42 @@ struct ObstacleSlot {
     active: bool,
 }
 
-// The skating race against the turtle or, in the challenge, the thief through the mine
+// One racing crunchling, the resident one or the visiting friend's, with its anims, speed and distance
+#[derive(Clone, Copy, Debug, Default)]
+struct Skater {
+    actor: i32,
+    friend: bool,
+    anims: [u16; SK_COUNT],
+    bbox: u16,
+    state: i32,
+    speed: f32,
+    max_speed: f32,
+    pos: f32,
+    berries: u32,
+    platform_jumps: u32,
+    ride_shift: f32,
+    ground_y: f32,
+}
+
+impl Skater {
+    // Top speed from the running stat, the race track's number
+    fn top_speed(running: i32) -> f32 {
+        (f64::from(running) * f64::from(0.3f32) + 14.0) as f32
+    }
+
+    fn racing(&self) -> bool {
+        matches!(self.state, PS_SKATING | PS_RIDING | PS_AIRBORNE)
+    }
+}
+
+// The skating race against the turtle, the thief through the mine, or a visiting friend's crunchling
 #[derive(Debug)]
 pub struct RunningScreen {
     strips: [ScrollStrip; 5],
     slots: Vec<ObstacleSlot>,
     anims: [u16; ANIM_COUNT],
     sfx: [u16; SFX_COUNT],
-    speed: f32,
-    state: i32,
-    max_speed: f32,
-    accel: f32,
-    brake: f32,
+    skaters: Vec<Skater>,
     ground_y: f32,
     opp_speed: f32,
     opp_max_speed: f32,
@@ -144,7 +183,6 @@ pub struct RunningScreen {
     music: u32,
     voice: u32,
     spawn_dist: f32,
-    berries: u32,
     last_tick_ms: u32,
     fraction: f32,
     seconds: u16,
@@ -154,18 +192,35 @@ pub struct RunningScreen {
     half_dist: f32,
     cross_dist: f32,
     opp_finish_dist: f32,
+    line_pos: Option<f32>,
+    winner: Option<usize>,
     result: i32,
     commentator: i32,
     intro_pending: bool,
     challenge: i32,
     car_speed: f32,
     finish_frames: u32,
-    platform_jumps: u32,
 }
 
 // Formats a race time the way sprintf(" %d.%02d") did
 fn time_text(seconds: u16, hundredths: i32) -> String {
     format!(" {seconds}.{hundredths:02}")
+}
+
+// Screen x of a skater in a friend match, half the lead over the other away from the camera centre
+fn versus_screen_x(pos: f32, other: f32) -> f32 {
+    VERSUS_CENTER + (pos - other) / 2.0
+}
+
+// Who a lead too long for one screen hands the race to, None while both are still in frame
+fn left_behind(lead: f32) -> Option<usize> {
+    if lead > VERSUS_GAP_LIMIT {
+        Some(0)
+    } else if lead < -VERSUS_GAP_LIMIT {
+        Some(1)
+    } else {
+        None
+    }
 }
 
 impl Default for RunningScreen {
@@ -175,11 +230,7 @@ impl Default for RunningScreen {
             slots: Vec::new(),
             anims: [0; ANIM_COUNT],
             sfx: [0; SFX_COUNT],
-            speed: 0.0,
-            state: PS_PRE_INIT,
-            max_speed: 0.0,
-            accel: 0.0,
-            brake: 0.0,
+            skaters: Vec::new(),
             ground_y: 0.0,
             opp_speed: 0.0,
             opp_max_speed: 0.0,
@@ -190,7 +241,6 @@ impl Default for RunningScreen {
             music: 0,
             voice: 0,
             spawn_dist: 0.0,
-            berries: 0,
             last_tick_ms: 0,
             fraction: 0.0,
             seconds: 0,
@@ -200,13 +250,14 @@ impl Default for RunningScreen {
             half_dist: 0.0,
             cross_dist: 0.0,
             opp_finish_dist: 0.0,
+            line_pos: None,
+            winner: None,
             result: RACE_NONE,
             commentator: COMM_DRIVE_IN,
             intro_pending: false,
             challenge: 0,
             car_speed: 0.0,
             finish_frames: 0,
-            platform_jumps: 0,
         }
     }
 }
@@ -221,24 +272,27 @@ impl RunningScreen {
         self.slots.push(ObstacleSlot { actor_id, kind, idle, alt, hit: false, active: false });
     }
 
-    // Runs the opponent on its own until its finish, or by the friend's right and left keys, then brakes it
-    fn update_opponent_speed(&mut self, friend: Option<(bool, bool)>) {
+    // True while the resident crunchling races the visiting friend's rather than the turtle or thief
+    fn versus(&self) -> bool {
+        self.skaters.len() == 2
+    }
+
+    // Speed the world scrolls at, the resident skater's or the midpoint of both in a friend match
+    fn cam_speed(&self) -> f32 {
+        if self.versus() { (self.skaters[0].speed + self.skaters[1].speed) / 2.0 } else { self.skaters[0].speed }
+    }
+
+    fn skater_index(&self, actor: i32) -> Option<usize> {
+        self.skaters.iter().position(|s| s.actor == actor)
+    }
+
+    // Runs the turtle or thief on its own until its finish, then brakes it
+    fn update_opponent_speed(&mut self) {
         self.opp_finish_dist -= self.opp_speed;
         if 0.0 <= self.opp_finish_dist {
-            match friend {
-                None | Some((true, _)) => {
-                    self.opp_speed += self.opp_accel;
-                    if self.opp_max_speed < self.opp_speed {
-                        self.opp_speed = self.opp_max_speed;
-                    }
-                }
-                Some((false, true)) => {
-                    self.opp_speed -= self.opp_decel;
-                    if self.opp_speed < 0.0 {
-                        self.opp_speed = 0.0;
-                    }
-                }
-                Some((false, false)) => {}
+            self.opp_speed += self.opp_accel;
+            if self.opp_max_speed < self.opp_speed {
+                self.opp_speed = self.opp_max_speed;
             }
         } else {
             self.opp_speed = (f64::from(self.opp_speed) - f64::from(self.opp_decel) * f64::from(0.4f32)) as f32;
@@ -248,9 +302,39 @@ impl RunningScreen {
         }
     }
 
+    // Loads a skater's nine crunchling animations through its own recoloured palette
+    async fn load_skater<H: Host>(ctx: &mut Ctx<H>, skin: Skin<'_>, actor: i32, friend: bool) -> Option<Skater> {
+        let adult_as_type0 = skin.data.shown_stage() == 1;
+        let (_, palette) = skin.palette(&mut ctx.av, &mut ctx.host, "checkPads", false, adult_as_type0).await?;
+        let mut skater = Skater { actor, friend, bbox: NO_HANDLE, ..Skater::default() };
+        let suffixes = [
+            (SK_SKATING, "skating"),
+            (SK_JUMP, "jump"),
+            (SK_CRASH, "crash"),
+            (SK_GETUP, "getup"),
+            (SK_VICTORY, "victory"),
+            (SK_GOTO_DEFEAT, "gotoDefeat"),
+            (SK_DEFEAT, "defeat"),
+            (SK_SPIN, "spin"),
+            (SK_STRETCH, "stretch"),
+        ];
+        for (index, suffix) in suffixes {
+            skater.anims[index] = skin.anim(&mut ctx.av, &mut ctx.host, suffix, false, adult_as_type0, &palette).await?;
+        }
+        if skin.data.shown_stage() == 2 {
+            skater.bbox = ctx.av.get_anim(&mut ctx.host, "adult_sk8_bbox").await?;
+        }
+        let row = PLAYER_OFFSETS[skin.data.anim_index(false) as usize];
+        ctx.actors.set_draw_offset(actor, row[0], row[1]);
+        skater.ride_shift = row[2] as f32;
+        skater.max_speed = Skater::top_speed(skin.data.running);
+        Some(skater)
+    }
+
     // Rewards the running stat for done or Again and picks the next state
     fn on_mouse_hit<H: Host>(&self, ctx: &mut Ctx<H>, id: i32) -> u32 {
         let mut result = RESULT_CONTINUE;
+        let berries = self.skaters[0].berries;
         if id == 5 {
             if ctx.player.food != 0 {
                 ctx.player.food -= 1;
@@ -259,13 +343,13 @@ impl RunningScreen {
                 ctx.player.happiness -= 1;
             }
             ctx.player.add_stats(1, 0, 0);
-            if 4 < self.berries {
+            if 4 < berries {
                 ctx.player.add_stats(1, 0, 0);
             }
             result = STATE_HOME_WORLD;
         } else if id == 6 {
             ctx.player.add_stats(1, 0, 0);
-            if 4 < self.berries {
+            if 4 < berries {
                 ctx.player.add_stats(1, 0, 0);
             }
             result = STATE_RUNNING;
@@ -273,43 +357,48 @@ impl RunningScreen {
         result
     }
 
-    // Dispatches INIT_OBJECT and ANIM_END and lands the player on GROUND_REACHED
+    // Dispatches INIT_OBJECT and ANIM_END and lands a skater on GROUND_REACHED
     async fn on_actor_event<H: Host>(&mut self, ctx: &mut Ctx<H>, kind: i32, actor_id: i32) {
-        let a = self.anims;
         if kind == EVENT_INIT_OBJECT {
             self.on_init_object(ctx, actor_id).await;
         } else if kind == EVENT_ANIM_END {
             self.on_anim_end(ctx, actor_id);
-        } else if kind == EVENT_GROUND_REACHED && actor_id == ACTOR_PLAYER {
-            if self.state == PS_AIRBORNE || self.state == PS_RIDING {
-                ctx.actors.set_anims(&ctx.av, ACTOR_PLAYER, a[A_SKATING], a[A_SKATING], false, STATE_RESTART_FORWARD);
-                self.state = PS_SKATING;
+        } else if kind == EVENT_GROUND_REACHED && let Some(i) = self.skater_index(actor_id) {
+            let s = &mut self.skaters[i];
+            if s.state == PS_AIRBORNE || s.state == PS_RIDING {
+                let skating = s.anims[SK_SKATING];
+                ctx.actors.set_anims(&ctx.av, s.actor, skating, skating, false, STATE_RESTART_FORWARD);
+                s.state = PS_SKATING;
                 ctx.av.play_sfx(self.sfx[SFX_LAND], -1);
-            } else if self.state == PS_CRASH_AIR {
-                self.state = PS_CRASH_SLIDE;
+            } else if s.state == PS_CRASH_AIR {
+                s.state = PS_CRASH_SLIDE;
             }
         }
     }
 
-    // Places the player, opponent, car and commentator and hides every other actor
+    // Places the skaters, the opponent, car and commentator and hides every other actor
     async fn on_init_object<H: Host>(&mut self, ctx: &mut Ctx<H>, actor_id: i32) {
         let a = self.anims;
-        match actor_id {
-            0 => {
-                ctx.actors.set_anims(&ctx.av, actor_id, a[A_STRETCH], a[A_STRETCH], false, STATE_RESTART_FORWARD);
-                ctx.actors.set_pos(actor_id, 40.0, self.ground_y);
-                ctx.actors.face(&ctx.av, actor_id, FACING_NONE);
-                if ctx.player.stage == 2 {
-                    ctx.actors.set_bbox_anim(actor_id, a[A_ADULT_BBOX]);
-                }
-                self.state = PS_SKATING;
+        if let Some(i) = self.skater_index(actor_id) {
+            let s = &mut self.skaters[i];
+            let stretch = s.anims[SK_STRETCH];
+            ctx.actors.set_anims(&ctx.av, actor_id, stretch, stretch, false, STATE_RESTART_FORWARD);
+            let x = if i == 0 { 40.0 } else { 90.0 };
+            ctx.actors.set_pos(actor_id, x, s.ground_y);
+            ctx.actors.face(&ctx.av, actor_id, FACING_NONE);
+            if s.bbox != NO_HANDLE {
+                ctx.actors.set_bbox_anim(actor_id, s.bbox);
             }
-            1 => {
+            s.state = PS_SKATING;
+            return;
+        }
+        match actor_id {
+            ACTOR_OPPONENT => {
                 ctx.actors.set_anims(&ctx.av, actor_id, a[A_OPP_WAIT], a[A_OPP_WAIT], false, STATE_RESTART_FORWARD);
                 ctx.actors.set_pos(actor_id, 90.0, self.opp_y);
                 ctx.actors.face(&ctx.av, actor_id, FACING_NONE);
             }
-            2 => {
+            ACTOR_CAR => {
                 if self.challenge == 0 {
                     ctx.actors.set_anims(&ctx.av, actor_id, a[A_CAR], a[A_CAR], false, STATE_RESTART_FORWARD);
                     ctx.actors.set_pos(actor_id, -650.0, 350.0);
@@ -324,7 +413,7 @@ impl RunningScreen {
                     ctx.actors.set_visible(actor_id, false);
                 }
             }
-            3 => {
+            ACTOR_CAPN => {
                 ctx.actors.set_anims(&ctx.av, actor_id, a[A_CAPN_028], a[A_CAPN_028], false, STATE_RESTART_FORWARD);
                 ctx.actors.set_pos(actor_id, -500.0, 290.0);
                 ctx.actors.face(&ctx.av, actor_id, FACING_NONE);
@@ -354,19 +443,289 @@ impl RunningScreen {
         }
     }
 
-    // Returns the player to skating or the defeat hold and ends the commentator laugh
+    // Returns a skater to skating or the defeat hold and ends the commentator laugh
     fn on_anim_end<H: Host>(&mut self, ctx: &mut Ctx<H>, actor_id: i32) {
         let a = self.anims;
-        if actor_id == ACTOR_PLAYER {
-            if self.state == PS_FINISHED {
-                ctx.actors.set_anims(&ctx.av, ACTOR_PLAYER, a[A_DEFEAT], a[A_DEFEAT], false, STATE_RESTART_FORWARD);
+        if let Some(i) = self.skater_index(actor_id) {
+            let s = &mut self.skaters[i];
+            if s.state == PS_FINISHED {
+                let defeat = s.anims[SK_DEFEAT];
+                ctx.actors.set_anims(&ctx.av, s.actor, defeat, defeat, false, STATE_RESTART_FORWARD);
             } else {
-                ctx.actors.set_anims(&ctx.av, ACTOR_PLAYER, a[A_SKATING], a[A_SKATING], false, STATE_RESTART_FORWARD);
-                self.state = PS_SKATING;
+                let skating = s.anims[SK_SKATING];
+                ctx.actors.set_anims(&ctx.av, s.actor, skating, skating, false, STATE_RESTART_FORWARD);
+                s.state = PS_SKATING;
             }
         } else if actor_id == ACTOR_CAPN && self.commentator == COMM_LAUGH {
             ctx.actors.set_anims(&ctx.av, ACTOR_CAPN, a[A_TV_005], a[A_TV_005], false, STATE_RESTART_FORWARD);
             self.commentator = COMM_TV_IDLE;
+        }
+    }
+
+    // Sets every skater's screen x from its speed alone or from its lead in a friend match
+    fn place_skaters<H: Host>(&mut self, ctx: &mut Ctx<H>) {
+        if self.versus() {
+            let (p0, p1) = (self.skaters[0].pos, self.skaters[1].pos);
+            ctx.actors.set_x(self.skaters[0].actor, versus_screen_x(p0, p1));
+            ctx.actors.set_x(self.skaters[1].actor, versus_screen_x(p1, p0));
+        } else {
+            let speed = self.skaters[0].speed;
+            ctx.actors.set_x(ACTOR_PLAYER, (f64::from(speed) * 6.0 + 50.0) as f32);
+            ctx.actors.add_x(ACTOR_OPPONENT, self.opp_speed - speed);
+        }
+    }
+
+    // Jumps, accelerates and brakes one skater by the keys its side holds, or slides out of a crash
+    async fn skater_input<H: Host>(&mut self, ctx: &mut Ctx<H>, i: usize, held: Held) {
+        let s = self.sfx;
+        let decided = self.winner.is_some();
+        let skater = self.skaters[i];
+        let held = if decided && skater.racing() { Held::default() } else { held };
+        if (skater.state == PS_SKATING || skater.state == PS_RIDING) && held.space {
+            ctx.av.play_sfx(s[SFX_JUMP], -1);
+            let jump = skater.anims[SK_JUMP];
+            ctx.actors.set_anims(&ctx.av, skater.actor, jump, jump, false, STATE_RESTART_FORWARD);
+            ctx.actors.set_gravity(skater.actor, -24.0, 1.5, ftol(f64::from(skater.ground_y)), 100.0);
+            if skater.state == PS_RIDING {
+                let spin = skater.anims[SK_SPIN];
+                ctx.actors.set_anims(&ctx.av, skater.actor, spin, spin, false, STATE_RESTART_FORWARD);
+                ctx.actors.add_y(skater.actor, -20.0);
+                self.skaters[i].platform_jumps += 1;
+                if 2 < self.skaters[i].platform_jumps {
+                    self.skaters[i].platform_jumps = 0;
+                    if self.commentator == COMM_TV_IDLE {
+                        let a = self.anims;
+                        ctx.actors.set_anims(&ctx.av, ACTOR_CAPN, a[A_TV_006], a[A_TV_006], false, STATE_RESTART_FORWARD);
+                        if ctx.rand_range(0, 2) == 0 {
+                            self.voice = ctx.av.play_stream_sound(&mut ctx.host, "052.wav", false, self.voice).await;
+                        } else {
+                            self.voice = ctx.av.play_stream_sound(&mut ctx.host, "053.wav", false, self.voice).await;
+                        }
+                        self.commentator = COMM_TV_SPEECH;
+                    }
+                }
+            }
+            self.skaters[i].state = PS_AIRBORNE;
+        }
+        let skater = &mut self.skaters[i];
+        if skater.racing() {
+            if held.right {
+                skater.speed += ACCEL;
+                if skater.max_speed < skater.speed {
+                    skater.speed = skater.max_speed;
+                }
+            }
+            if held.left {
+                skater.speed -= BRAKE;
+                if skater.speed < 0.5 {
+                    skater.speed = 0.5;
+                }
+            }
+        } else if skater.state == PS_CRASH_SLIDE {
+            skater.speed -= 0.25;
+            if skater.speed < 0.5 {
+                skater.speed = 0.5;
+                let getup = skater.anims[SK_GETUP];
+                ctx.actors.set_anims(&ctx.av, skater.actor, getup, getup, true, STATE_RESTART_FORWARD);
+                skater.state = PS_GETTING_UP;
+            }
+        } else if skater.state == PS_FINISHED && decided {
+            skater.speed = (f64::from(skater.speed) - f64::from(BRAKE) * f64::from(0.8f32)) as f32;
+            if skater.speed < 0.0 {
+                skater.speed = 0.0;
+            }
+        }
+        self.skaters[i].pos += self.skaters[i].speed;
+    }
+
+    // Crashes, rides, slows or scores one skater against every active obstacle it touches
+    fn skater_collide<H: Host>(&mut self, ctx: &mut Ctx<H>, i: usize) {
+        let a = self.anims;
+        let s = self.sfx;
+        for slot_index in 0..self.slots.len() {
+            let slot = self.slots[slot_index];
+            let skater = self.skaters[i];
+            if !slot.active || !ctx.actors.overlaps(&ctx.av, skater.actor, slot.actor_id) {
+                continue;
+            }
+            let first = !slot.hit;
+            let mut apply_alt = first;
+            if slot.kind == KIND_CRASH || slot.kind == KIND_PLATFORM {
+                let mut crash = first;
+                if slot.kind == KIND_PLATFORM && (skater.state == PS_AIRBORNE || skater.state == PS_RIDING) {
+                    let mut vy = ctx.actors.vel_y(skater.actor);
+                    let me = ctx.actors.bbox(&ctx.av, skater.actor);
+                    let obstacle = ctx.actors.bbox(&ctx.av, slot.actor_id);
+                    if vy < 3.0 {
+                        vy = 3.0;
+                    }
+                    if f64::from(me[3]) < f64::from(obstacle[1]) + f64::from(vy) {
+                        ctx.actors.add_y(skater.actor, (-(me[3] - obstacle[1])) as f32);
+                        ctx.actors.set_gravity(skater.actor, 0.0, 2.0, ftol(f64::from(skater.ground_y)), 100.0);
+                        crash = false;
+                        apply_alt = false;
+                        if skater.state != PS_RIDING {
+                            self.skaters[i].state = PS_RIDING;
+                            ctx.av.play_sfx(s[SFX_LAND], -1);
+                        }
+                    }
+                }
+                if crash && skater.racing() {
+                    if self.commentator != COMM_TV_SPEECH && self.commentator != COMM_LAUGH {
+                        ctx.actors.set_anims(&ctx.av, ACTOR_CAPN, a[A_TV_004], a[A_TV_004], true, STATE_RESTART_FORWARD);
+                        self.commentator = COMM_LAUGH;
+                    }
+                    ctx.av.play_sfx(s[SFX_CRASH], -1);
+                    let crash_anim = skater.anims[SK_CRASH];
+                    ctx.actors.set_anims(&ctx.av, skater.actor, crash_anim, crash_anim, false, STATE_RESTART_FORWARD);
+                    ctx.actors.set_gravity(skater.actor, -16.0, 2.0, ftol(f64::from(skater.ground_y)), 100.0);
+                    self.skaters[i].state = PS_CRASH_AIR;
+                    if self.skaters[i].speed < 7.0 {
+                        self.skaters[i].speed = 7.0;
+                    }
+                }
+            } else if first && slot.kind == KIND_BERRY {
+                ctx.av.play_sfx(s[SFX_BERRY], -1);
+                ctx.actors.set_visible(slot.actor_id, false);
+                self.skaters[i].berries += 1;
+                if i == 0 {
+                    ctx.scene.set_text_by_id(OBJ_BERRIES, &self.skaters[0].berries.to_string());
+                }
+            } else if first && slot.kind == KIND_FINISH {
+                apply_alt = false;
+            } else if first {
+                if self.skaters[i].speed <= 3.0 {
+                    self.skaters[i].speed = 0.5;
+                } else {
+                    self.skaters[i].speed -= 3.0;
+                }
+            }
+            if apply_alt {
+                ctx.actors.set_anims(&ctx.av, slot.actor_id, slot.alt, slot.alt, false, STATE_RESTART_FORWARD);
+                ctx.actors.set_layer_mask(slot.actor_id, LAYER_FRONT);
+                self.slots[slot_index].hit = true;
+            }
+        }
+    }
+
+    // Poses a skater for the result once it is back on its board
+    fn pose_result<H: Host>(&mut self, ctx: &mut Ctx<H>, i: usize, won: bool) {
+        let skater = &mut self.skaters[i];
+        if skater.state != PS_SKATING {
+            return;
+        }
+        if won {
+            let victory = skater.anims[SK_VICTORY];
+            ctx.actors.set_anims(&ctx.av, skater.actor, victory, victory, false, STATE_RESTART_FORWARD);
+        } else {
+            let fall = skater.anims[SK_GOTO_DEFEAT];
+            ctx.actors.set_anims(&ctx.av, skater.actor, fall, fall, true, STATE_RESTART_FORWARD);
+        }
+        ctx.actors.set_layer_mask(skater.actor, LAYER_MAIN);
+        skater.state = PS_FINISHED;
+    }
+
+    // Sends the Cap'n back to his car for the drive in, or off screen in a challenge
+    fn reset_capn<H: Host>(&mut self, ctx: &mut Ctx<H>) {
+        let a = self.anims;
+        self.car_speed = 42.0;
+        ctx.actors.set_anims(&ctx.av, ACTOR_CAPN, a[A_CAPN_028], a[A_CAPN_028], false, STATE_RESTART_FORWARD);
+        ctx.actors.set_anims(&ctx.av, ACTOR_CAR, a[A_CAR], a[A_CAR], false, STATE_RESTART_FORWARD);
+        ctx.actors.set_pos(ACTOR_CAPN, -500.0, 290.0);
+        ctx.actors.set_pos(ACTOR_CAR, -650.0, 350.0);
+        ctx.actors.set_layer_mask(ACTOR_CAPN, LAYER_FRONT);
+    }
+
+    // Brakes the resident skater over the line, poses both racers and shows the times outside a challenge
+    fn solo_finish<H: Host>(&mut self, ctx: &mut Ctx<H>) {
+        let a = self.anims;
+        self.cross_dist -= self.skaters[0].speed;
+        if self.cross_dist >= 0.0 {
+            return;
+        }
+        let skater = &mut self.skaters[0];
+        skater.speed = (f64::from(skater.speed) - f64::from(BRAKE) * f64::from(0.8f32)) as f32;
+        if skater.speed < 0.0 {
+            skater.speed = 0.0;
+        }
+        let mut x = (f64::from(skater.speed) * 6.0 + 50.0 - f64::from(self.cross_dist)) as f32;
+        if 500.0 < x {
+            x = 500.0;
+        }
+        ctx.actors.set_x(ACTOR_PLAYER, x);
+        if self.result == RACE_NONE {
+            self.result = RACE_PLAYER_FIRST;
+            if self.opp_finish_dist < 0.0 {
+                self.result = RACE_OPPONENT_FIRST;
+            }
+        }
+        if self.skaters[0].state == PS_SKATING {
+            let won = self.result == RACE_PLAYER_FIRST;
+            self.pose_result(ctx, 0, won);
+            if won {
+                ctx.actors.set_anims(&ctx.av, ACTOR_OPPONENT, a[A_OPP_LOSE], a[A_OPP_WAIT], false, STATE_RESTART_FORWARD);
+                if self.challenge != 0 {
+                    ctx.scene.set_hover_by_id(OBJ_GOOD_JOB, HOVER_NORMAL);
+                }
+            } else {
+                ctx.actors.set_anims(&ctx.av, ACTOR_OPPONENT, a[A_OPP_VICTORY], a[A_OPP_VICTORY], false, STATE_RESTART_FORWARD);
+            }
+            self.reset_capn(ctx);
+            ctx.actors.set_layer_mask(ACTOR_OPPONENT, LAYER_MAIN);
+            if self.challenge == 0 {
+                self.commentator = COMM_END_DRIVE_IN;
+                let best_frac = ctx.player.run_best_frac as u16;
+                let previous_best = time_text(ctx.player.run_best_secs, i32::from(best_frac));
+                if self.seconds < ctx.player.run_best_secs
+                    || (ctx.player.run_best_secs == self.seconds && f64::from(self.fraction) * 5.0 < f64::from(best_frac))
+                {
+                    ctx.player.run_best_secs = self.seconds;
+                    ctx.player.run_best_frac = (ftol(f64::from(self.fraction)) * 5) as i16;
+                }
+                ctx.scene.set_text_by_id(4, &previous_best);
+                ctx.scene.set_hover_by_id(3, HOVER_NORMAL);
+                ctx.scene.set_hover_by_id(4, HOVER_NORMAL);
+                ctx.scene.set_hover_by_id(5, HOVER_NORMAL);
+                ctx.scene.set_hover_by_id(6, HOVER_NORMAL);
+                ctx.cursor.set_visible(true);
+            }
+        }
+        self.timer_resync = true;
+    }
+
+    // Decides a friend match at the line or a lead of a screen and poses both racers as they settle
+    fn versus_race<H: Host>(&mut self, ctx: &mut Ctx<H>) {
+        if self.winner.is_none() {
+            let (p0, p1) = (self.skaters[0].pos, self.skaters[1].pos);
+            if let Some(line) = self.line_pos {
+                let crossed: Vec<usize> = (0..2).filter(|&i| self.skaters[i].pos >= line + CROSS_PAST).collect();
+                self.winner = crossed.into_iter().max_by(|&x, &y| self.skaters[x].pos.total_cmp(&self.skaters[y].pos));
+            }
+            if self.winner.is_none() {
+                self.winner = left_behind(p0 - p1);
+            }
+            if let Some(w) = self.winner {
+                self.result = if w == 0 { RACE_PLAYER_FIRST } else { RACE_OPPONENT_FIRST };
+                let name = if w == 0 { ctx.player.name_str() } else { ctx.session.guest_name() };
+                ctx.scene.set_text_by_id(OBJ_GOOD_JOB, &wins_text(&name));
+                ctx.scene.set_hover_by_id(OBJ_GOOD_JOB, HOVER_NORMAL);
+                self.reset_capn(ctx);
+            }
+        }
+        if let Some(w) = self.winner {
+            for i in 0..2 {
+                self.pose_result(ctx, i, i == w);
+            }
+            self.timer_resync = true;
+        }
+    }
+
+    // True once every racer whose result the exit waits on has settled into its pose
+    fn finished(&self) -> bool {
+        if self.versus() {
+            self.skaters.iter().all(|s| s.state == PS_FINISHED)
+        } else {
+            self.skaters[0].state == PS_FINISHED
         }
     }
 }
@@ -375,24 +734,25 @@ impl<H: Host> Screen<H> for RunningScreen {
     // Loads Running.wam, the strips, actors, anims, sounds and obstacle slots for the variant
     async fn init(&mut self, ctx: &mut Ctx<H>) -> bool {
         self.challenge = i32::from(ctx.player.challenge_active);
+        let guest = ctx.session.guest().filter(|_| self.challenge != 0).cloned();
         ctx.scene.load(&mut ctx.av, &mut ctx.host, "Running").await;
-        ctx.scene.assign_id("berries", 1);
-        ctx.scene.assign_id("time", 2);
+        ctx.scene.assign_id("berries", OBJ_BERRIES);
+        ctx.scene.assign_id("time", OBJ_TIME);
         ctx.scene.assign_id("BestTitle", 3);
         ctx.scene.assign_id("BestTime", 4);
         ctx.scene.assign_id("done", 5);
         ctx.scene.assign_id("Again", 6);
-        ctx.scene.set_text_by_id(2, "0.00");
-        ctx.scene.set_text_by_id(1, "0");
+        ctx.scene.set_text_by_id(OBJ_TIME, "0.00");
+        ctx.scene.set_text_by_id(OBJ_BERRIES, "0");
         ctx.scene.set_text_by_id(4, "0.00");
         ctx.scene.set_hover_by_id(3, HOVER_HIDDEN);
         ctx.scene.set_hover_by_id(4, HOVER_HIDDEN);
         ctx.scene.set_hover_by_id(5, HOVER_HIDDEN);
         ctx.scene.set_hover_by_id(6, HOVER_HIDDEN);
-        ctx.scene.assign_id("GoodJob", 7);
-        ctx.scene.set_hover_by_id(7, HOVER_HIDDEN);
+        ctx.scene.assign_id("GoodJob", OBJ_GOOD_JOB);
+        ctx.scene.set_hover_by_id(OBJ_GOOD_JOB, HOVER_HIDDEN);
         if self.challenge != 0 {
-            ctx.scene.set_text_by_id(7, "You Win!");
+            ctx.scene.set_text_by_id(OBJ_GOOD_JOB, "You Win!");
         }
         let Some(mouse) = ctx.av.get_anim(&mut ctx.host, "mouse").await else { return false };
         ctx.cursor.set_anim(&ctx.av, mouse);
@@ -488,32 +848,26 @@ impl<H: Host> Screen<H> for RunningScreen {
         for id in [1, 4, 5, 6, 7, 8, 9, 10, 0xb, 3, 2, 0, 0xc] {
             ctx.actors.add_actor(id, true);
         }
-        let dy = PLAYER_OFFSETS[ctx.player.anim_index(false) as usize][1];
-        let dx = PLAYER_OFFSETS[ctx.player.anim_index(false) as usize][0];
-        ctx.actors.set_draw_offset(ACTOR_PLAYER, dx, dy);
-        let adult_as_type0 = ctx.player.stage == 1;
-        let name = ctx.player.anim_name("checkPads", false, adult_as_type0);
-        let Some(pads) = ctx.av.get_anim_retain_image(&mut ctx.host, &name).await else { return false };
-        self.anims[A_CHECK_PADS] = pads;
-        let mut palette = Palette24::default();
-        ctx.av.get_anim_palette(pads, &mut palette);
-        ctx.player.recolor_palette(&mut palette);
-        ctx.av.set_anim_palette(pads, &palette);
-        let player_anims = [
-            (A_SKATING, "skating"),
-            (A_JUMP, "jump"),
-            (A_CRASH, "crash"),
-            (A_GETUP, "getup"),
-            (A_VICTORY, "victory"),
-            (A_GOTO_DEFEAT, "gotoDefeat"),
-            (A_DEFEAT, "defeat"),
-            (A_SPIN, "spin"),
-            (A_STRETCH, "stretch"),
-        ];
-        for (index, suffix) in player_anims {
-            let name = ctx.player.anim_name(suffix, false, adult_as_type0);
-            let Some(h) = ctx.av.get_anim_use_palette(&mut ctx.host, &name, &palette).await else { return false };
-            self.anims[index] = h;
+        if self.challenge == 0 {
+            self.opp_y = 280.0;
+            self.ground_y = 280.0;
+        } else {
+            self.opp_y = 205.0;
+            self.ground_y = 320.0;
+        }
+        self.skaters.clear();
+        let resident = ctx.player.clone();
+        let Some(mut player) = Self::load_skater(ctx, Skin::host(&resident), ACTOR_PLAYER, false).await else {
+            return false;
+        };
+        player.ground_y = self.ground_y;
+        self.skaters.push(player);
+        if let Some(g) = &guest {
+            let Some(mut rival) = Self::load_skater(ctx, Skin::guest(g), ACTOR_OPPONENT, true).await else {
+                return false;
+            };
+            rival.ground_y = self.ground_y - VERSUS_RIVAL_DEPTH;
+            self.skaters.push(rival);
         }
         let shared_anims = [
             (A_LINE, "sk8bw7line"),
@@ -536,10 +890,6 @@ impl<H: Host> Screen<H> for RunningScreen {
             let Some(h) = ctx.av.get_anim(&mut ctx.host, name).await else { return false };
             self.anims[index] = h;
         }
-        if ctx.player.stage == 2 {
-            let Some(h) = ctx.av.get_anim(&mut ctx.host, "adult_sk8_bbox").await else { return false };
-            self.anims[A_ADULT_BBOX] = h;
-        }
         if self.challenge == 0 {
             let variant_anims = [
                 (A_CART, "hot_dog_cart"),
@@ -559,31 +909,26 @@ impl<H: Host> Screen<H> for RunningScreen {
                 let Some(h) = ctx.av.get_anim(&mut ctx.host, name).await else { return false };
                 self.anims[index] = h;
             }
-            self.opp_y = 280.0;
-            self.ground_y = 280.0;
         } else {
-            let variant_anims = [
+            let mut variant_anims = vec![
                 (A_BLOCK, "minecarblock"),
                 (A_BLOCK_ANIM, "minecarfallanim"),
                 (A_PLATFORM, "sk8ug3platform"),
-                (A_OPP_RUN, "thief_sk8_sk8_loop"),
-                (A_OPP_WAIT, "thief_sk8_sk8_wait"),
-                (A_OPP_LOSE, "thief_sk8_sk8_lose"),
-                (A_OPP_VICTORY, "thief_sk8_sk8_victory"),
             ];
+            if guest.is_none() {
+                variant_anims.extend([
+                    (A_OPP_RUN, "thief_sk8_sk8_loop"),
+                    (A_OPP_WAIT, "thief_sk8_sk8_wait"),
+                    (A_OPP_LOSE, "thief_sk8_sk8_lose"),
+                    (A_OPP_VICTORY, "thief_sk8_sk8_victory"),
+                ]);
+            }
             for (index, name) in variant_anims {
                 let Some(h) = ctx.av.get_anim(&mut ctx.host, name).await else { return false };
                 self.anims[index] = h;
             }
-            self.opp_y = 205.0;
-            self.ground_y = 320.0;
         }
         let a = self.anims;
-        self.speed = 0.0;
-        self.max_speed = (f64::from(ctx.player.running) * f64::from(0.3f32) + 14.0) as f32;
-        self.accel = 0.6;
-        self.brake = 0.7;
-        self.state = PS_PRE_INIT;
         self.opp_max_speed = 14.0;
         self.opp_accel = 0.7;
         self.opp_decel = 1.2;
@@ -615,8 +960,9 @@ impl<H: Host> Screen<H> for RunningScreen {
         self.spawn_dist = 700.0;
         self.cross_dist = self.finish_dist + 620.0;
         self.opp_finish_dist = self.cross_dist + 150.0;
+        self.line_pos = None;
+        self.winner = None;
         self.result = RACE_NONE;
-        self.berries = 0;
         self.seconds = 0;
         self.fraction = 0.0;
         self.timer_resync = true;
@@ -629,7 +975,6 @@ impl<H: Host> Screen<H> for RunningScreen {
         self.commentator = COMM_DRIVE_IN;
         self.voice = 0;
         self.finish_frames = 0;
-        self.platform_jumps = 0;
         true
     }
 
@@ -638,8 +983,9 @@ impl<H: Host> Screen<H> for RunningScreen {
         let a = self.anims;
         let s = self.sfx;
         let mut result = RESULT_CONTINUE;
+        let cam = self.cam_speed();
         for strip in &mut self.strips {
-            strip.scroll(&ctx.av, self.speed);
+            strip.scroll(&ctx.av, cam);
         }
         for strip in &mut self.strips[..4] {
             strip.fill_and_draw(&mut ctx.av, &mut ctx.rand);
@@ -658,15 +1004,14 @@ impl<H: Host> Screen<H> for RunningScreen {
         while let Some(ev) = ctx.actors.pop_event() {
             self.on_actor_event(ctx, ev.kind, ev.actor_id).await;
         }
-        ctx.actors.set_x(ACTOR_PLAYER, (f64::from(self.speed) * 6.0 + 50.0) as f32);
-        ctx.actors.add_x(ACTOR_OPPONENT, self.opp_speed - self.speed);
+        self.place_skaters(ctx);
         if self.commentator == COMM_DRIVE_OUT {
-            ctx.actors.add_x(ACTOR_CAPN, -self.speed);
-            ctx.actors.add_x(ACTOR_CAR, -self.speed);
+            ctx.actors.add_x(ACTOR_CAPN, -cam);
+            ctx.actors.add_x(ACTOR_CAR, -cam);
         }
         for slot in &self.slots {
             if slot.active {
-                ctx.actors.add_x(slot.actor_id, -self.speed);
+                ctx.actors.add_x(slot.actor_id, -cam);
             }
         }
         if self.countdown < 0x28 {
@@ -676,133 +1021,15 @@ impl<H: Host> Screen<H> for RunningScreen {
                     ctx.actors.set_visible(ACTOR_SIGN, false);
                 }
             }
-            let friend = ctx
-                .session
-                .helper_present()
-                .then(|| (ctx.helper_key_down(KEY_RIGHT), ctx.helper_key_down(KEY_LEFT)));
-            self.update_opponent_speed(friend);
-            self.cross_dist -= self.speed;
-            if self.cross_dist < 0.0 {
-                self.speed = (f64::from(self.speed) - f64::from(self.brake) * f64::from(0.8f32)) as f32;
-                if self.speed < 0.0 {
-                    self.speed = 0.0;
-                }
-                let mut x = (f64::from(self.speed) * 6.0 + 50.0 - f64::from(self.cross_dist)) as f32;
-                if 500.0 < x {
-                    x = 500.0;
-                }
-                ctx.actors.set_x(ACTOR_PLAYER, x);
-                if self.result == RACE_NONE {
-                    self.result = RACE_PLAYER_FIRST;
-                    if self.opp_finish_dist < 0.0 {
-                        self.result = RACE_OPPONENT_FIRST;
-                    }
-                }
-                if self.state == PS_SKATING {
-                    if self.result == RACE_PLAYER_FIRST {
-                        ctx.actors.set_anims(&ctx.av, ACTOR_PLAYER, a[A_VICTORY], a[A_VICTORY], false, STATE_RESTART_FORWARD);
-                        ctx.actors.set_anims(
-                            &ctx.av,
-                            ACTOR_OPPONENT,
-                            a[A_OPP_LOSE],
-                            a[A_OPP_WAIT],
-                            false,
-                            STATE_RESTART_FORWARD,
-                        );
-                        if self.challenge != 0 {
-                            ctx.scene.set_hover_by_id(7, HOVER_NORMAL);
-                        }
-                    } else {
-                        ctx.actors.set_anims(
-                            &ctx.av,
-                            ACTOR_PLAYER,
-                            a[A_GOTO_DEFEAT],
-                            a[A_GOTO_DEFEAT],
-                            true,
-                            STATE_RESTART_FORWARD,
-                        );
-                        ctx.actors.set_anims(
-                            &ctx.av,
-                            ACTOR_OPPONENT,
-                            a[A_OPP_VICTORY],
-                            a[A_OPP_VICTORY],
-                            false,
-                            STATE_RESTART_FORWARD,
-                        );
-                    }
-                    self.car_speed = 42.0;
-                    ctx.actors.set_anims(&ctx.av, ACTOR_CAPN, a[A_CAPN_028], a[A_CAPN_028], false, STATE_RESTART_FORWARD);
-                    ctx.actors.set_anims(&ctx.av, ACTOR_CAR, a[A_CAR], a[A_CAR], false, STATE_RESTART_FORWARD);
-                    ctx.actors.set_pos(ACTOR_CAPN, -500.0, 290.0);
-                    ctx.actors.set_pos(ACTOR_CAR, -650.0, 350.0);
-                    ctx.actors.set_layer_mask(ACTOR_CAPN, LAYER_FRONT);
-                    ctx.actors.set_layer_mask(ACTOR_PLAYER, LAYER_MAIN);
-                    ctx.actors.set_layer_mask(ACTOR_OPPONENT, LAYER_MAIN);
-                    self.state = PS_FINISHED;
-                    if self.challenge == 0 {
-                        self.commentator = COMM_END_DRIVE_IN;
-                        let best_frac = ctx.player.run_best_frac as u16;
-                        let previous_best = time_text(ctx.player.run_best_secs, i32::from(best_frac));
-                        if self.seconds < ctx.player.run_best_secs
-                            || (ctx.player.run_best_secs == self.seconds
-                                && f64::from(self.fraction) * 5.0 < f64::from(best_frac))
-                        {
-                            ctx.player.run_best_secs = self.seconds;
-                            ctx.player.run_best_frac = (ftol(f64::from(self.fraction)) * 5) as i16;
-                        }
-                        ctx.scene.set_text_by_id(4, &previous_best);
-                        ctx.scene.set_hover_by_id(3, HOVER_NORMAL);
-                        ctx.scene.set_hover_by_id(4, HOVER_NORMAL);
-                        ctx.scene.set_hover_by_id(5, HOVER_NORMAL);
-                        ctx.scene.set_hover_by_id(6, HOVER_NORMAL);
-                        ctx.cursor.set_visible(true);
-                    }
-                }
-                self.timer_resync = true;
+            if self.versus() {
+                self.versus_race(ctx);
+            } else {
+                self.update_opponent_speed();
+                self.solo_finish(ctx);
             }
-            if (self.state == PS_SKATING || self.state == PS_RIDING) && ctx.av.is_key_down(KEY_SPACE) {
-                ctx.av.play_sfx(s[SFX_JUMP], -1);
-                ctx.actors.set_anims(&ctx.av, ACTOR_PLAYER, a[A_JUMP], a[A_JUMP], false, STATE_RESTART_FORWARD);
-                ctx.actors.set_gravity(ACTOR_PLAYER, -24.0, 1.5, ftol(f64::from(self.ground_y)), 100.0);
-                if self.state == PS_RIDING {
-                    ctx.actors.set_anims(&ctx.av, ACTOR_PLAYER, a[A_SPIN], a[A_SPIN], false, STATE_RESTART_FORWARD);
-                    ctx.actors.add_y(ACTOR_PLAYER, -20.0);
-                    self.platform_jumps += 1;
-                    if 2 < self.platform_jumps {
-                        self.platform_jumps = 0;
-                        if self.commentator == COMM_TV_IDLE {
-                            ctx.actors.set_anims(&ctx.av, ACTOR_CAPN, a[A_TV_006], a[A_TV_006], false, STATE_RESTART_FORWARD);
-                            if ctx.rand_range(0, 2) == 0 {
-                                self.voice = ctx.av.play_stream_sound(&mut ctx.host, "052.wav", false, self.voice).await;
-                            } else {
-                                self.voice = ctx.av.play_stream_sound(&mut ctx.host, "053.wav", false, self.voice).await;
-                            }
-                            self.commentator = COMM_TV_SPEECH;
-                        }
-                    }
-                }
-                self.state = PS_AIRBORNE;
-            }
-            if self.state == PS_SKATING || self.state == PS_RIDING || self.state == PS_AIRBORNE {
-                if ctx.av.is_key_down(KEY_RIGHT) {
-                    self.speed += self.accel;
-                    if self.max_speed < self.speed {
-                        self.speed = self.max_speed;
-                    }
-                }
-                if ctx.av.is_key_down(KEY_LEFT) {
-                    self.speed -= self.brake;
-                    if self.speed < 0.5 {
-                        self.speed = 0.5;
-                    }
-                }
-            } else if self.state == PS_CRASH_SLIDE {
-                self.speed -= 0.25;
-                if self.speed < 0.5 {
-                    self.speed = 0.5;
-                    ctx.actors.set_anims(&ctx.av, ACTOR_PLAYER, a[A_GETUP], a[A_GETUP], true, STATE_RESTART_FORWARD);
-                    self.state = PS_GETTING_UP;
-                }
+            for i in 0..self.skaters.len() {
+                let held = ctx.held(self.skaters[i].friend);
+                self.skater_input(ctx, i, held).await;
             }
             let now = ctx.time_ms();
             let mut dt = now.wrapping_sub(self.last_tick_ms) as f32;
@@ -817,7 +1044,7 @@ impl<H: Host> Screen<H> for RunningScreen {
                 self.seconds = self.seconds.wrapping_add(1);
             }
             let hundredths = ftol(f64::from(self.fraction)) * 5;
-            ctx.scene.set_text_by_id(2, &time_text(self.seconds, hundredths));
+            ctx.scene.set_text_by_id(OBJ_TIME, &time_text(self.seconds, hundredths));
         } else if !self.intro_pending {
             if self.challenge == 0 || self.challenge == 3 {
                 self.countdown -= 1;
@@ -836,8 +1063,13 @@ impl<H: Host> Screen<H> for RunningScreen {
             }
             if self.countdown == 0x28 {
                 ctx.actors.set_anims(&ctx.av, ACTOR_SIGN, a[A_GO], a[A_GO], false, STATE_STOPPED);
-                ctx.actors.set_anims(&ctx.av, ACTOR_PLAYER, a[A_SKATING], a[A_SKATING], false, STATE_RESTART_FORWARD);
-                ctx.actors.set_anims(&ctx.av, ACTOR_OPPONENT, a[A_OPP_RUN], a[A_OPP_RUN], false, STATE_RESTART_FORWARD);
+                for skater in &self.skaters {
+                    let skating = skater.anims[SK_SKATING];
+                    ctx.actors.set_anims(&ctx.av, skater.actor, skating, skating, false, STATE_RESTART_FORWARD);
+                }
+                if !self.versus() {
+                    ctx.actors.set_anims(&ctx.av, ACTOR_OPPONENT, a[A_OPP_RUN], a[A_OPP_RUN], false, STATE_RESTART_FORWARD);
+                }
                 if self.challenge == 0 {
                     ctx.actors.set_anims_delayed(
                         &ctx.av,
@@ -945,67 +1177,11 @@ impl<H: Host> Screen<H> for RunningScreen {
             }
             _ => {}
         }
-        for i in 0..self.slots.len() {
-            let slot = self.slots[i];
-            if !slot.active || !ctx.actors.overlaps(&ctx.av, ACTOR_PLAYER, slot.actor_id) {
-                continue;
-            }
-            let first = !slot.hit;
-            let mut apply_alt = first;
-            if slot.kind == KIND_CRASH || slot.kind == KIND_PLATFORM {
-                let mut crash = first;
-                if slot.kind == KIND_PLATFORM && (self.state == PS_AIRBORNE || self.state == PS_RIDING) {
-                    let mut vy = ctx.actors.vel_y(ACTOR_PLAYER);
-                    let player = ctx.actors.bbox(&ctx.av, ACTOR_PLAYER);
-                    let obstacle = ctx.actors.bbox(&ctx.av, slot.actor_id);
-                    if vy < 3.0 {
-                        vy = 3.0;
-                    }
-                    if f64::from(player[3]) < f64::from(obstacle[1]) + f64::from(vy) {
-                        ctx.actors.add_y(ACTOR_PLAYER, (-(player[3] - obstacle[1])) as f32);
-                        ctx.actors.set_gravity(ACTOR_PLAYER, 0.0, 2.0, ftol(f64::from(self.ground_y)), 100.0);
-                        crash = false;
-                        apply_alt = false;
-                        if self.state != PS_RIDING {
-                            self.state = PS_RIDING;
-                            ctx.av.play_sfx(s[SFX_LAND], -1);
-                        }
-                    }
-                }
-                if crash && (self.state == PS_SKATING || self.state == PS_AIRBORNE || self.state == PS_RIDING) {
-                    if self.commentator != COMM_TV_SPEECH && self.commentator != COMM_LAUGH {
-                        ctx.actors.set_anims(&ctx.av, ACTOR_CAPN, a[A_TV_004], a[A_TV_004], true, STATE_RESTART_FORWARD);
-                        self.commentator = COMM_LAUGH;
-                    }
-                    ctx.av.play_sfx(s[SFX_CRASH], -1);
-                    ctx.actors.set_anims(&ctx.av, ACTOR_PLAYER, a[A_CRASH], a[A_CRASH], false, STATE_RESTART_FORWARD);
-                    ctx.actors.set_gravity(ACTOR_PLAYER, -16.0, 2.0, ftol(f64::from(self.ground_y)), 100.0);
-                    self.state = PS_CRASH_AIR;
-                    if self.speed < 7.0 {
-                        self.speed = 7.0;
-                    }
-                }
-            } else if first && slot.kind == KIND_BERRY {
-                ctx.av.play_sfx(s[SFX_BERRY], -1);
-                ctx.actors.set_visible(slot.actor_id, false);
-                self.berries += 1;
-                ctx.scene.set_text_by_id(1, &self.berries.to_string());
-            } else if first && slot.kind == KIND_FINISH {
-                apply_alt = false;
-            } else if first {
-                if self.speed <= 3.0 {
-                    self.speed = 0.5;
-                } else {
-                    self.speed -= 3.0;
-                }
-            }
-            if apply_alt {
-                ctx.actors.set_anims(&ctx.av, slot.actor_id, slot.alt, slot.alt, false, STATE_RESTART_FORWARD);
-                ctx.actors.set_layer_mask(slot.actor_id, LAYER_FRONT);
-                self.slots[i].hit = true;
-            }
+        for i in 0..self.skaters.len() {
+            self.skater_collide(ctx, i);
         }
-        if self.speed <= 1.0 || (self.state != PS_SKATING && self.state != PS_RIDING) {
+        let rolling = self.skaters.iter().any(|k| k.speed > 1.0 && (k.state == PS_SKATING || k.state == PS_RIDING));
+        if !rolling {
             if self.loop_channel != INVALID_HANDLE {
                 ctx.av.stop_sfx(self.loop_channel);
                 self.loop_channel = INVALID_HANDLE;
@@ -1020,13 +1196,14 @@ impl<H: Host> Screen<H> for RunningScreen {
             }
         }
         if 0.0 <= self.spawn_dist || self.finish_dist <= 1000.0 {
-            self.spawn_dist -= self.speed;
+            self.spawn_dist -= cam;
         } else {
             let i = ctx.rand_range(0, self.slots.len() as i32 - 1) as usize;
             let slot = self.slots[i];
             if !slot.active {
                 let y = self.ground_y + 85.0;
-                let x = ctx.rand_range(0, 150) as f32 + 800.0;
+                let ahead = if self.versus() { VERSUS_SPAWN_X } else { 800.0 };
+                let x = ctx.rand_range(0, 150) as f32 + ahead;
                 ctx.actors.set_pos(slot.actor_id, x, y);
                 if slot.kind == KIND_BERRY || slot.idle != slot.alt {
                     ctx.actors.set_anims(&ctx.av, slot.actor_id, slot.idle, slot.idle, false, STATE_RESTART_FORWARD);
@@ -1047,16 +1224,22 @@ impl<H: Host> Screen<H> for RunningScreen {
             self.strips[4].set_stopped(true);
         }
         if 0.0 <= self.finish_dist {
-            self.finish_dist -= self.speed;
+            self.finish_dist -= cam;
             if self.finish_dist < 0.0 {
                 let last = self.slots.len() - 1;
                 let line = self.slots[last];
-                ctx.actors.set_pos(line.actor_id, 700.0, 367.0);
+                ctx.actors.set_pos(line.actor_id, LINE_SCREEN_X, 367.0);
                 ctx.actors.set_anims(&ctx.av, line.actor_id, line.idle, line.idle, false, STATE_RESTART_FORWARD);
                 ctx.actors.set_visible(line.actor_id, true);
                 self.slots[last].active = true;
                 self.finish_dist = -1.0;
-                ctx.actors.set_layer_mask(ACTOR_PLAYER, LAYER_FRONT);
+                if self.versus() {
+                    let cam_pos = (self.skaters[0].pos + self.skaters[1].pos) / 2.0;
+                    self.line_pos = Some(cam_pos + LINE_SCREEN_X - VERSUS_CENTER);
+                }
+                for skater in &self.skaters {
+                    ctx.actors.set_layer_mask(skater.actor, LAYER_FRONT);
+                }
                 ctx.actors.set_layer_mask(ACTOR_OPPONENT, LAYER_FRONT);
             }
         }
@@ -1066,24 +1249,26 @@ impl<H: Host> Screen<H> for RunningScreen {
             self.voice = ctx.av.play_stream_sound(&mut ctx.host, "058.wav", false, self.voice).await;
             self.commentator = COMM_TV_SPEECH;
         }
-        if self.state == PS_RIDING {
-            let row = ctx.player.anim_index(false) as usize;
-            ctx.actors.add_y(ACTOR_PLAYER, PLAYER_OFFSETS[row][2] as f32);
+        for skater in &self.skaters {
+            if skater.state == PS_RIDING {
+                ctx.actors.add_y(skater.actor, skater.ride_shift);
+            }
         }
         ctx.actors.draw(&mut ctx.av, &ctx.scene, LAYER_MAIN);
         ctx.actors.draw(&mut ctx.av, &ctx.scene, LAYER_FRONT);
-        if self.state == PS_RIDING {
-            let row = ctx.player.anim_index(false) as usize;
-            ctx.actors.add_y(ACTOR_PLAYER, (-PLAYER_OFFSETS[row][2]) as f32);
+        for skater in &self.skaters {
+            if skater.state == PS_RIDING {
+                ctx.actors.add_y(skater.actor, -skater.ride_shift);
+            }
         }
         if ctx.av.is_key_down(KEY_ESC) {
             result = STATE_HOME_WORLD;
         }
-        if self.challenge != 0 && self.state == PS_FINISHED {
+        if self.challenge != 0 && self.finished() {
             self.finish_frames += 1;
             if 0x78 < self.finish_frames {
                 ctx.player.challenge_won = u8::from(self.result == RACE_PLAYER_FIRST);
-                result = STATE_CHALLENGE;
+                result = if self.versus() { STATE_HOME_WORLD } else { STATE_CHALLENGE };
             }
         }
         self.strips[4].fill_and_draw(&mut ctx.av, &mut ctx.rand);
@@ -1112,27 +1297,12 @@ mod tests {
         g.opp_accel = 0.7;
         g.opp_decel = 1.2;
         g.opp_speed = 13.8;
-        g.update_opponent_speed(None);
+        g.update_opponent_speed();
         assert_eq!(g.opp_speed, 14.0);
-        g.update_opponent_speed(None);
+        g.update_opponent_speed();
         assert_eq!(g.opp_speed, (14.0f64 - f64::from(1.2f32) * f64::from(0.4f32)) as f32);
         g.opp_speed = 0.1;
-        g.update_opponent_speed(None);
-        assert_eq!(g.opp_speed, 0.0);
-    }
-
-    #[test]
-    fn friend_keys_drive_the_opponent() {
-        let mut g = RunningScreen::new();
-        g.opp_finish_dist = 1000.0;
-        g.opp_max_speed = 14.0;
-        g.opp_accel = 0.7;
-        g.opp_decel = 1.2;
-        g.update_opponent_speed(Some((false, false)));
-        assert_eq!(g.opp_speed, 0.0);
-        g.update_opponent_speed(Some((true, false)));
-        assert_eq!(g.opp_speed, 0.7);
-        g.update_opponent_speed(Some((false, true)));
+        g.update_opponent_speed();
         assert_eq!(g.opp_speed, 0.0);
     }
 
@@ -1154,5 +1324,29 @@ mod tests {
         assert_eq!(time_text(3, 5), " 3.05");
         assert_eq!(time_text(100, 0), " 100.00");
         assert_eq!(time_text(12, 95), " 12.95");
+    }
+
+    #[test]
+    fn friend_match_camera_splits_the_lead() {
+        assert_eq!(versus_screen_x(0.0, 0.0), VERSUS_CENTER);
+        assert_eq!(versus_screen_x(300.0, 100.0), VERSUS_CENTER + 100.0);
+        assert_eq!(versus_screen_x(100.0, 300.0), VERSUS_CENTER - 100.0);
+        assert_eq!(left_behind(VERSUS_GAP_LIMIT), None);
+        assert_eq!(left_behind(VERSUS_GAP_LIMIT + 1.0), Some(0));
+        assert_eq!(left_behind(-VERSUS_GAP_LIMIT - 1.0), Some(1));
+    }
+
+    #[test]
+    fn top_speed_follows_the_running_stat() {
+        assert_eq!(Skater::top_speed(0), 14.0);
+        assert_eq!(Skater::top_speed(20), (20.0f64 * f64::from(0.3f32) + 14.0) as f32);
+        let cam = RunningScreen { skaters: vec![Skater { speed: 10.0, ..Skater::default() }], ..RunningScreen::default() };
+        assert_eq!(cam.cam_speed(), 10.0);
+        let both = RunningScreen {
+            skaters: vec![Skater { speed: 10.0, ..Skater::default() }, Skater { speed: 4.0, ..Skater::default() }],
+            ..RunningScreen::default()
+        };
+        assert!(both.versus());
+        assert_eq!(both.cam_speed(), 7.0);
     }
 }

@@ -8,6 +8,7 @@ pub mod online;
 pub mod player;
 pub mod scene;
 pub mod scroll_strip;
+pub mod skin;
 pub mod video;
 pub mod ctx;
 pub mod screens;

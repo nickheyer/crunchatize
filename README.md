@@ -1,6 +1,6 @@
 # crunchatize
 
-Cap'n Crunch's Crunchling Adventure (1999) rebuilt in Rust from the original binaries and compiled to WebAssembly, playing from the game's own data files, with a Go Online mode that lets a friend join your home world: https://crunchatize.app
+Cap'n Crunch's Crunchling Adventure (1999) rebuilt in Rust from the original binaries and compiled to WebAssembly, playing from the game's own data files, with a Go Online mode that lets a friend bring their crunchling into your home world and race it against yours: https://crunchatize.app
 
 ## Install
 

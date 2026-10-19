@@ -8,7 +8,7 @@ use std::task::{Context, Poll, Waker};
 
 use avmanager::input::DeviceState;
 use avmanager::sound::Sound;
-use crunch::ctx::{STATE_HOME_WORLD, STATE_RUNNING};
+use crunch::ctx::{STATE_CHALLENGE, STATE_HOME_WORLD, STATE_JUMPING, STATE_RUNNING, STATE_THROWING};
 use crunch::game::Runner;
 use crunch::host::{Host, NetEvent};
 use crunch::online::dialog::Page;
@@ -17,6 +17,7 @@ use crunch::online::session::CLOSE_HOST_LEFT;
 use crunch::online::wire::{self, Message};
 use crunch::online::{Notice, Phase};
 use crunch::player::PlayerData;
+use crunch::skin::GUEST_PREFIX;
 
 const DATA_DIR: &str = "/home/nick/code/crunchatize/dev/disc/iso/CrunchData";
 const ASSETS_DIR: &str = "/home/nick/code/crunchatize/assets";
@@ -32,7 +33,9 @@ const SCAN_S: usize = 0x1f;
 const SCAN_RETURN: usize = 0x1c;
 const SCAN_SPACE: usize = 0x39;
 const SCAN_RIGHT: usize = 0xcd;
-const SCAN_LEFT: usize = 0xcb;
+const SCAN_ESC: usize = 1;
+const ACTOR_CRUNCHLING: i32 = 0;
+const ACTOR_GUEST: i32 = 7;
 
 fn block_on<F: Future>(fut: F) -> F::Output {
     let mut fut = pin!(fut);
@@ -301,6 +304,40 @@ fn tap(host: &mut Player, joiner: &mut Player, who: Side, key: usize) {
     steps(host, joiner, 2);
 }
 
+// Points a hand at an actor's hand zone until the given happiness reading rises
+fn praise(host: &mut Player, joiner: &mut Player, who: Side, actor: i32, zone_y: i16, read: impl Fn(&Player) -> i16) -> bool {
+    let before = read(host);
+    for _ in 0..300 {
+        let a = host.runner.ctx.actors.get(actor);
+        if a.anim.anim == avmanager::anim::AnimFrame::default().anim || !a.mouse_hittable {
+            step(host, joiner);
+            continue;
+        }
+        let b = host.runner.ctx.actors.bbox(&host.runner.ctx.av, actor);
+        let visible = host.runner.ctx.cursor.visible;
+        let x = ((b[0] + b[2]) / 2) as i16;
+        let y = zone_y.clamp((b[1] + 1) as i16, (b[3] - 1) as i16);
+        let hand = if who == Side::Host { &*host } else { &*joiner };
+        hand.point((x, y), visible);
+        step(host, joiner);
+        if read(host) > before {
+            return true;
+        }
+    }
+    false
+}
+
+// Runs frames until the host reaches a game state, false when it never does
+fn wait_for_state(host: &mut Player, joiner: &mut Player, wanted: &[u32], frames: usize) -> bool {
+    for _ in 0..frames {
+        if wanted.contains(&host.runner.game.state) {
+            return true;
+        }
+        step(host, joiner);
+    }
+    wanted.contains(&host.runner.game.state)
+}
+
 // Centre of a home world object's hit box in the host's scene
 fn object_centre(host: &Player, name: &str) -> (i16, i16) {
     let o = host
@@ -344,7 +381,11 @@ fn host_and_helper_stay_in_lockstep() {
     assert_eq!(host.phase(), Phase::HostPlaying { code: CODE.into() });
     assert_eq!(joiner.phase(), Phase::JoinPlaying { code: CODE.into() });
     assert!(host.runner.game.dialog.is_none() && joiner.runner.game.dialog.is_none(), "the box stayed open");
-    assert_eq!(joiner.runner.ctx.player.name_str(), "CAPN", "the helper is not playing the host's crunchling");
+    assert_eq!(joiner.runner.ctx.player.name_str(), "CAPN", "the joiner is not simulating the host's world");
+    for p in [&host, &joiner] {
+        assert_eq!(p.runner.ctx.session.guest().map(PlayerData::name_str), Some("MATE".into()), "no guest crunchling");
+        assert!(p.runner.ctx.actors.find(ACTOR_GUEST).is_some(), "the friend's crunchling is not in the home world");
+    }
     assert_eq!(host.runner.ctx.session.epoch(), joiner.runner.ctx.session.epoch());
 
     // Both hands wander for a while
@@ -357,28 +398,16 @@ fn host_and_helper_stay_in_lockstep() {
     assert_eq!(joiner.runner.ctx.session.desyncs(), 0);
     assert!(joiner.runner.ctx.session.replayed() >= 90);
 
-    // The helper praises the crunchling with the hand tool
-    let happiness_before = host.runner.ctx.player.happiness;
-    let mut praised = false;
-    for _ in 0..200 {
-        let crunchling = host.runner.ctx.actors.get(0);
-        if crunchling.anim.anim == avmanager::anim::AnimFrame::default().anim || !crunchling.mouse_hittable {
-            step(&mut host, &mut joiner);
-            continue;
-        }
-        let b = host.runner.ctx.actors.bbox(&host.runner.ctx.av, 0);
-        let visible = host.runner.ctx.cursor.visible;
-        let x = ((b[0] + b[2]) / 2) as i16;
-        let y = 250i16.clamp((b[1] + 1) as i16, (b[3] - 1) as i16);
-        joiner.point((x, y), visible);
-        step(&mut host, &mut joiner);
-        if host.runner.ctx.player.happiness > happiness_before {
-            praised = true;
-            break;
-        }
-    }
-    assert!(praised, "the helper's hand could not praise the crunchling");
+    // The helper praises the host's crunchling, then the host praises the friend's with their own hand
+    let own = |p: &Player| p.runner.ctx.player.happiness;
+    assert!(praise(&mut host, &mut joiner, Side::Joiner, ACTOR_CRUNCHLING, 250, own), "the helper could not praise");
     joiner.point((600, 400), false);
+    steps(&mut host, &mut joiner, 30);
+    let guest_happiness = |p: &Player| p.runner.ctx.session.guest().map_or(0, |g| g.happiness);
+    assert!(praise(&mut host, &mut joiner, Side::Host, ACTOR_GUEST, 245, guest_happiness), "the guest was not praised");
+    let praised_guest = guest_happiness(&host);
+    assert_eq!(guest_happiness(&joiner), praised_guest, "the friend's record differs between the machines");
+    host.point((600, 400), false);
     steps(&mut host, &mut joiner, 30);
     assert_eq!(host.hash(), joiner.hash(), "the worlds drifted apart after the praise");
 
@@ -412,44 +441,67 @@ fn host_and_helper_stay_in_lockstep() {
     assert_eq!(joiner.runner.ctx.session.desyncs(), 0);
     assert!(!host.runner.ctx.host.log.iter().any(|l| l.contains("lost sync")), "{:?}", host.runner.ctx.host.log);
 
-    // Both switch to the thief's skate race, where the friend drives the thief with their own keys
-    for p in [&mut host, &mut joiner] {
-        p.runner.ctx.player.challenge_active = 1;
-        assert!(block_on(p.runner.game.switch_state(&mut p.runner.ctx, STATE_RUNNING)));
-    }
-    assert_eq!(host.runner.ctx.session.helper_name, "MATE");
-    host.keys(&[SCAN_SPACE]);
-    steps(&mut host, &mut joiner, 4);
-    host.keys(&[SCAN_RIGHT]);
-    let (start_x, _) = host.runner.ctx.actors.pos(0);
-    let mut racing = false;
-    for _ in 0..900 {
-        step(&mut host, &mut joiner);
-        if host.runner.ctx.actors.pos(0).0 > start_x + 30.0 {
-            racing = true;
+    // The friend picks challenges from the host's home until every game has pitted the two crunchlings
+    let games = [STATE_RUNNING, STATE_JUMPING, STATE_THROWING];
+    let mut seen: Vec<u32> = Vec::new();
+    for _ in 0..12 {
+        if seen.len() == games.len() {
             break;
         }
+        let door = object_centre(&host, "challenge");
+        click(&mut host, &mut joiner, Side::Joiner, door);
+        assert!(wait_for_state(&mut host, &mut joiner, &[STATE_CHALLENGE], 1500), "the friend's click did not start a challenge");
+        assert_eq!(host.runner.game.state, joiner.runner.game.state);
+        steps(&mut host, &mut joiner, 20);
+        host.keys(&[SCAN_SPACE]);
+        assert!(wait_for_state(&mut host, &mut joiner, &games, 600), "the challenge never reached a game");
+        host.keys(&[]);
+        let game = host.runner.game.state;
+        assert_eq!(game, joiner.runner.game.state);
+        let (suffix, guest_actor, adult_as_type0) = match game {
+            STATE_RUNNING => ("skating", 1, true),
+            STATE_JUMPING => ("stance", 0, false),
+            _ => ("throw_stance", 1, false),
+        };
+        let guest = host.runner.ctx.session.guest().cloned().expect("guest record");
+        let key = format!("{GUEST_PREFIX}{}", guest.anim_name(suffix, false, adult_as_type0));
+        for p in [&host, &joiner] {
+            assert!(p.runner.ctx.av.anims.find(&key).is_some(), "the opponent is not wearing the friend's crunchling: {key}");
+        }
+
+        // The friend's own keys move the friend's crunchling once the countdown ends
+        let (guest_start, _) = host.runner.ctx.actors.pos(guest_actor);
+        joiner.keys(&[SCAN_RIGHT]);
+        let mut moved = false;
+        for _ in 0..900 {
+            step(&mut host, &mut joiner);
+            if host.runner.ctx.actors.pos(guest_actor).0 > guest_start + 30.0 {
+                moved = true;
+                break;
+            }
+        }
+        assert!(moved, "the friend's right key did not move the friend's crunchling in state {game:#x}");
+        joiner.keys(&[]);
+        steps(&mut host, &mut joiner, 10);
+        assert_eq!(host.hash(), joiner.hash(), "the worlds drifted apart in the match");
+        assert_eq!(joiner.runner.ctx.session.desyncs(), 0);
+        if !seen.contains(&game) {
+            seen.push(game);
+        }
+        tap(&mut host, &mut joiner, Side::Host, SCAN_ESC);
+        assert!(wait_for_state(&mut host, &mut joiner, &[STATE_HOME_WORLD], 60), "escape did not bring both home");
+        assert!(host.runner.ctx.actors.find(ACTOR_GUEST).is_some(), "the friend's crunchling did not come home");
+        let mut settled = false;
+        for _ in 0..600 {
+            step(&mut host, &mut joiner);
+            if host.runner.ctx.cursor.visible {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "the home world never gave the hands back");
     }
-    assert!(racing, "the race never started");
-    let (thief_x, _) = host.runner.ctx.actors.pos(1);
-    steps(&mut host, &mut joiner, 30);
-    let (thief_still, _) = host.runner.ctx.actors.pos(1);
-    assert!(thief_still < thief_x, "the thief moved on its own while the friend held nothing");
-    host.keys(&[SCAN_LEFT]);
-    joiner.keys(&[SCAN_RIGHT]);
-    steps(&mut host, &mut joiner, 30);
-    let (thief_driven, _) = host.runner.ctx.actors.pos(1);
-    assert!(thief_driven > thief_still, "the friend's right key did not drive the thief");
-    host.keys(&[]);
-    joiner.keys(&[]);
-    steps(&mut host, &mut joiner, 10);
-    assert_eq!(host.hash(), joiner.hash(), "the worlds drifted apart in the race");
-    assert_eq!(joiner.runner.ctx.session.desyncs(), 0);
-    for p in [&mut host, &mut joiner] {
-        p.runner.ctx.player.challenge_active = 0;
-        assert!(block_on(p.runner.game.switch_state(&mut p.runner.ctx, STATE_HOME_WORLD)));
-    }
-    steps(&mut host, &mut joiner, 20);
+    assert_eq!(seen.len(), games.len(), "only these games were drawn in twelve challenges {seen:?}");
     assert_eq!(host.hash(), joiner.hash(), "the worlds drifted apart back home");
 
     // The host quits, the helper returns to their own crunchling with the box explaining why
@@ -472,6 +524,8 @@ fn host_and_helper_stay_in_lockstep() {
     }
     assert_eq!(joiner.phase(), Phase::Offline);
     assert_eq!(joiner.runner.ctx.player.name_str(), "MATE", "the helper did not get their own crunchling back");
+    assert_eq!(joiner.runner.ctx.player.happiness, praised_guest, "the praise did not travel home with the crunchling");
+    assert!(joiner.runner.ctx.session.guest().is_none());
     assert_eq!(joiner.runner.ctx.globals.save_name, "joiner.crn");
     assert_eq!(joiner.runner.ctx.session.notice(), Notice::HostLeft);
     assert_eq!(joiner.runner.game.dialog.as_ref().map(|d| d.page()), Some(Page::Join));

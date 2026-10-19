@@ -1,8 +1,8 @@
 use avmanager::input::DeviceState;
 
-use crate::player::{NAME_CAPACITY, PlayerData, SAVE_SIZE};
+use crate::player::{PlayerData, SAVE_SIZE};
 
-pub const PROTOCOL: u8 = 1;
+pub const PROTOCOL: u8 = 2;
 pub const CODE_LEN: usize = 4;
 
 const TAG_HELLO: u8 = 1;
@@ -16,12 +16,13 @@ const TAG_PEER_LEFT: u8 = 0x81;
 
 const KEY_BYTES: usize = 32;
 const DEVICE_LEN: usize = KEY_BYTES + 4 + 4 + 1 + 4 + 1;
+const RECORD_LEN: usize = SAVE_SIZE as usize;
 
 // Everything one side of a session says to the other, plus the two notices the server adds
 #[derive(Clone, Debug, PartialEq)]
 pub enum Message {
-    Hello { protocol: u8, name: String },
-    Start { epoch: u32, seed: u32, player: PlayerData, helper_name: String },
+    Hello { protocol: u8, player: PlayerData },
+    Start { epoch: u32, seed: u32, host: PlayerData, guest: PlayerData },
     Tick(Box<TickRecord>),
     Input(DeviceState),
     Leave,
@@ -80,18 +81,9 @@ fn get_device(bytes: &[u8]) -> Option<DeviceState> {
     Some(d)
 }
 
-fn put_name(out: &mut Vec<u8>, name: &str) {
-    let mut field = [0u8; NAME_CAPACITY];
-    let bytes = name.as_bytes();
-    let n = bytes.len().min(NAME_CAPACITY - 1);
-    field[..n].copy_from_slice(&bytes[..n]);
-    out.extend_from_slice(&field);
-}
-
-fn get_name(bytes: &[u8], at: usize) -> Option<String> {
-    let field = bytes.get(at..at + NAME_CAPACITY)?;
-    let end = field.iter().position(|&c| c == 0).unwrap_or(NAME_CAPACITY);
-    Some(String::from_utf8_lossy(&field[..end]).into_owned())
+fn get_record(bytes: &[u8], at: usize) -> Option<PlayerData> {
+    let raw: [u8; RECORD_LEN] = bytes.get(at..at + RECORD_LEN)?.try_into().ok()?;
+    Some(PlayerData::from_bytes(&raw))
 }
 
 fn get_u32(bytes: &[u8], at: usize) -> Option<u32> {
@@ -102,16 +94,16 @@ fn get_u32(bytes: &[u8], at: usize) -> Option<u32> {
 pub fn encode(msg: &Message) -> Vec<u8> {
     let mut out = Vec::new();
     match msg {
-        Message::Hello { protocol, name } => {
+        Message::Hello { protocol, player } => {
             out.extend_from_slice(&[TAG_HELLO, *protocol]);
-            put_name(&mut out, name);
+            out.extend_from_slice(&player.to_bytes());
         }
-        Message::Start { epoch, seed, player, helper_name } => {
+        Message::Start { epoch, seed, host, guest } => {
             out.push(TAG_START);
             out.extend_from_slice(&epoch.to_le_bytes());
             out.extend_from_slice(&seed.to_le_bytes());
-            out.extend_from_slice(&player.to_bytes());
-            put_name(&mut out, helper_name);
+            out.extend_from_slice(&host.to_bytes());
+            out.extend_from_slice(&guest.to_bytes());
         }
         Message::Tick(t) => {
             out.push(TAG_TICK);
@@ -153,14 +145,13 @@ pub fn encode(msg: &Message) -> Vec<u8> {
 pub fn decode(bytes: &[u8]) -> Option<Message> {
     let (&tag, body) = bytes.split_first()?;
     match tag {
-        TAG_HELLO => Some(Message::Hello { protocol: *body.first()?, name: get_name(body, 1)? }),
-        TAG_START => {
-            let epoch = get_u32(body, 0)?;
-            let seed = get_u32(body, 4)?;
-            let raw: [u8; SAVE_SIZE as usize] = body.get(8..8 + SAVE_SIZE as usize)?.try_into().ok()?;
-            let helper_name = get_name(body, 8 + SAVE_SIZE as usize)?;
-            Some(Message::Start { epoch, seed, player: PlayerData::from_bytes(&raw), helper_name })
-        }
+        TAG_HELLO => Some(Message::Hello { protocol: *body.first()?, player: get_record(body, 1)? }),
+        TAG_START => Some(Message::Start {
+            epoch: get_u32(body, 0)?,
+            seed: get_u32(body, 4)?,
+            host: get_record(body, 8)?,
+            guest: get_record(body, 8 + RECORD_LEN)?,
+        }),
         TAG_TICK => {
             let epoch = get_u32(body, 0)?;
             let seq = get_u32(body, 4)?;
@@ -201,11 +192,17 @@ mod tests {
         d
     }
 
+    fn record(name: &str, stage: u16) -> PlayerData {
+        let mut player = PlayerData::default();
+        player.set_name(name);
+        player.stage = stage;
+        player.food = 3;
+        player.flesh = [1, 2, 3];
+        player
+    }
+
     #[test]
     fn every_message_round_trips() {
-        let mut player = PlayerData::default();
-        player.set_name("spaz");
-        player.food = 3;
         let tick = TickRecord {
             epoch: 2,
             seq: 77,
@@ -216,8 +213,8 @@ mod tests {
             hash: 0x1234_5678,
         };
         for msg in [
-            Message::Hello { protocol: PROTOCOL, name: "MATE".into() },
-            Message::Start { epoch: 1, seed: 99, player, helper_name: "MATEY".into() },
+            Message::Hello { protocol: PROTOCOL, player: record("MATE", 1) },
+            Message::Start { epoch: 1, seed: 99, host: record("spaz", 2), guest: record("MATEY", 0) },
             Message::Tick(Box::new(tick)),
             Message::Input(device()),
             Message::Leave,
@@ -232,18 +229,12 @@ mod tests {
     #[test]
     fn short_and_unknown_frames_are_rejected() {
         assert_eq!(decode(&[]), None);
+        assert_eq!(decode(&[TAG_HELLO, PROTOCOL, 1, 2]), None);
         assert_eq!(decode(&[TAG_START, 1, 2]), None);
+        let one_record = encode(&Message::Hello { protocol: PROTOCOL, player: record("A", 0) });
+        assert_eq!(decode(&[&[TAG_START, 0, 0, 0, 0, 0, 0, 0, 0][..], &one_record[2..]].concat()), None);
         assert_eq!(decode(&[TAG_TICK]), None);
         assert_eq!(decode(&[0x7f]), None);
         assert_eq!(decode(&[TAG_CODE, b'A', b'B']), None);
-    }
-
-    #[test]
-    fn names_are_cut_to_the_save_field() {
-        let long = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".to_string();
-        let Some(Message::Hello { name, .. }) = decode(&encode(&Message::Hello { protocol: PROTOCOL, name: long })) else {
-            panic!("hello did not decode");
-        };
-        assert_eq!(name, "ABCDEFGHIJKLMNO");
     }
 }

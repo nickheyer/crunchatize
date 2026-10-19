@@ -39,40 +39,54 @@ impl Av {
         }
     }
 
+    // Loads a BAM file under a key, different from the file name for a second copy with its own colours
     async fn load_anim<H: Host>(
         &mut self,
         host: &mut H,
-        name: &str,
+        key: &str,
+        file: &str,
         palette: Option<&Palette24>,
         retain: bool,
     ) -> Option<u16> {
-        if let Some(h) = self.anims.find(&asset_key(name)) {
+        if let Some(h) = self.anims.find(&asset_key(key)) {
             return Some(h);
         }
-        let file = with_extension(name, ".bam");
+        let file = with_extension(file, ".bam");
         let Some(data) = host.read_file(&file).await else {
-            host.log(&format!("*Error loading {name}.bam"));
+            host.log(&format!("*Error loading {file}"));
             return None;
         };
         match bam::parse(&data) {
-            Ok(parsed) => Some(self.anims.load(name, &parsed, &mut self.bitmaps, palette, retain)),
+            Ok(parsed) => Some(self.anims.load(key, &parsed, &mut self.bitmaps, palette, retain)),
             Err(e) => {
-                host.log(&format!("*Error loading {name}.bam: {e}"));
+                host.log(&format!("*Error loading {file}: {e}"));
                 None
             }
         }
     }
 
     pub async fn get_anim<H: Host>(&mut self, host: &mut H, name: &str) -> Option<u16> {
-        self.load_anim(host, name, None, false).await
+        self.load_anim(host, name, name, None, false).await
     }
 
     pub async fn get_anim_use_palette<H: Host>(&mut self, host: &mut H, name: &str, palette: &Palette24) -> Option<u16> {
-        self.load_anim(host, name, Some(palette), false).await
+        self.load_anim(host, name, name, Some(palette), false).await
     }
 
     pub async fn get_anim_retain_image<H: Host>(&mut self, host: &mut H, name: &str) -> Option<u16> {
-        self.load_anim(host, name, None, true).await
+        self.load_anim(host, name, name, None, true).await
+    }
+
+    // Loads a file as a second copy under its own key so another crunchling can wear different colours
+    pub async fn get_anim_keyed<H: Host>(
+        &mut self,
+        host: &mut H,
+        key: &str,
+        file: &str,
+        palette: Option<&Palette24>,
+        retain: bool,
+    ) -> Option<u16> {
+        self.load_anim(host, key, file, palette, retain).await
     }
 
     // Writes the animation's frame rate into the target when the handle is live

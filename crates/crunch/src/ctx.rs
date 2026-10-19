@@ -8,6 +8,14 @@ use crate::online::Session;
 use crate::player::PlayerData;
 use crate::scene::Scene;
 
+// Space, right and left as one side of a match holds them this tick
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Held {
+    pub space: bool,
+    pub right: bool,
+    pub left: bool,
+}
+
 pub const STATE_BOOT: u32 = 3;
 pub const STATE_TITLE: u32 = 4;
 pub const STATE_LOAD_CRUNCH: u32 = 5;
@@ -83,9 +91,31 @@ impl<H: Host> Ctx<H> {
         self.session.time_ms(self.host.time_ms())
     }
 
+    // True while a challenge pits the resident crunchling against the visiting friend's
+    pub fn versus(&self) -> bool {
+        self.player.challenge_active != 0 && self.session.guest().is_some()
+    }
+
     // True while the friend holds a key, always false without a friend in the world
     pub fn helper_key_down(&self, code: i32) -> bool {
         self.session.helper_present() && self.session.helper_keys.is_key_down(code)
+    }
+
+    // The race keys one side holds, the friend's relayed keyboard or the host's own
+    pub fn held(&self, friend: bool) -> Held {
+        if friend {
+            Held {
+                space: self.helper_key_down(KEY_SPACE),
+                right: self.helper_key_down(KEY_RIGHT),
+                left: self.helper_key_down(KEY_LEFT),
+            }
+        } else {
+            Held {
+                space: self.av.is_key_down(KEY_SPACE),
+                right: self.av.is_key_down(KEY_RIGHT),
+                left: self.av.is_key_down(KEY_LEFT),
+            }
+        }
     }
 
     // Whether a streamed voice finished, answered from the host's record when replaying

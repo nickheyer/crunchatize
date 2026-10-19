@@ -87,12 +87,7 @@ impl Hand {
     }
 }
 
-struct Stash {
-    player: PlayerData,
-    globals: Globals,
-}
-
-// Connection phase, the lockstep record or replay of the current tick, and the helper's hand
+// Connection phase, the lockstep record or replay of the current tick, the friend's hand and crunchling
 pub struct Session {
     phase: Phase,
     epoch: u32,
@@ -106,11 +101,11 @@ pub struct Session {
     last_sent: Option<DeviceState>,
     pub helper: Hand,
     pub helper_keys: Input,
-    pub helper_name: String,
     pub local_hand: Hand,
     pub local: Input,
     pub helper_art: u16,
-    stash: Option<Stash>,
+    guest: Option<PlayerData>,
+    stash: Option<Globals>,
     pending_switch: Option<u32>,
     dialog_request: bool,
     notice: Notice,
@@ -140,10 +135,10 @@ impl Session {
             last_sent: None,
             helper: Hand::default(),
             helper_keys: Input::new(MOUSE_SENSITIVITY),
-            helper_name: String::new(),
             local_hand: Hand::default(),
             local: Input::new(MOUSE_SENSITIVITY),
             helper_art: NO_HANDLE,
+            guest: None,
             stash: None,
             pending_switch: None,
             dialog_request: false,
@@ -178,6 +173,19 @@ impl Session {
     // True on the machine whose player is the helper
     pub fn local_is_helper(&self) -> bool {
         matches!(self.phase, Phase::JoinPlaying { .. })
+    }
+
+    // The visiting friend's own crunchling, present on both machines while they play together
+    pub fn guest(&self) -> Option<&PlayerData> {
+        self.guest.as_ref()
+    }
+
+    pub fn guest_mut(&mut self) -> Option<&mut PlayerData> {
+        self.guest.as_mut()
+    }
+
+    pub fn guest_name(&self) -> String {
+        self.guest.as_ref().map(PlayerData::name_str).unwrap_or_default()
     }
 
     pub fn code(&self) -> Option<&str> {
@@ -348,10 +356,11 @@ pub fn poll_net<H: Host>(ctx: &mut Ctx<H>) {
     }
 }
 
+// Introduces this player's crunchling to the host once the join connection is up
 fn on_open<H: Host>(ctx: &mut Ctx<H>) {
     if let Phase::JoinConnecting { code } = &ctx.session.phase {
         let code = code.clone();
-        let hello = Message::Hello { protocol: PROTOCOL, name: ctx.player.name_str() };
+        let hello = Message::Hello { protocol: PROTOCOL, player: ctx.player.clone() };
         ctx.host.net_send(&wire::encode(&hello));
         ctx.session.phase = Phase::JoinWaiting { code };
     }
@@ -365,9 +374,9 @@ fn on_message<H: Host>(ctx: &mut Ctx<H>, message: Message) {
                 ctx.session.phase = Phase::HostWaiting { code };
             }
         }
-        Message::Hello { protocol, name } => match &ctx.session.phase {
+        Message::Hello { protocol, player } => match &ctx.session.phase {
             Phase::HostWaiting { .. } | Phase::HostPlaying { .. } if protocol == PROTOCOL => {
-                ctx.session.helper_name = name;
+                ctx.session.guest = Some(player);
                 start_as_host(ctx);
             }
             Phase::HostWaiting { .. } | Phase::HostPlaying { .. } => {
@@ -375,10 +384,9 @@ fn on_message<H: Host>(ctx: &mut Ctx<H>, message: Message) {
             }
             _ => {}
         },
-        Message::Start { epoch, seed, player, helper_name } => {
+        Message::Start { epoch, seed, host, guest } => {
             if matches!(ctx.session.phase, Phase::JoinWaiting { .. } | Phase::JoinPlaying { .. }) {
-                ctx.session.helper_name = helper_name;
-                begin_joined(ctx, epoch, seed, player);
+                begin_joined(ctx, epoch, seed, host, guest);
             }
         }
         Message::Tick(record) => {
@@ -395,10 +403,7 @@ fn on_message<H: Host>(ctx: &mut Ctx<H>, message: Message) {
             Phase::HostWaiting { code } | Phase::HostPlaying { code } => {
                 let code = code.clone();
                 ctx.host.log("online: the friend left");
-                ctx.session.phase = Phase::HostWaiting { code };
-                ctx.session.recording = None;
-                ctx.session.helper_input = DeviceState::new();
-                ctx.session.notice = Notice::FriendLeft;
+                friend_left(ctx, Phase::HostWaiting { code }, Notice::FriendLeft);
             }
             Phase::JoinWaiting { .. } | Phase::JoinPlaying { .. } => end_joined(ctx, Notice::HostLeft, true),
             _ => {}
@@ -434,28 +439,34 @@ fn on_closed<H: Host>(ctx: &mut Ctx<H>, code: u16, reason: &str) {
     }
 }
 
-fn go_offline<H: Host>(ctx: &mut Ctx<H>, notice: Notice) {
-    ctx.host.net_close();
-    ctx.session.phase = Phase::Offline;
-    ctx.session.recording = None;
-    ctx.session.helper_input = DeviceState::new();
-    ctx.session.last_sent = None;
-    ctx.session.notice = notice;
+// Sends the friend's crunchling home and restarts the host's world alone, keeping or dropping the room
+fn friend_left<H: Host>(ctx: &mut Ctx<H>, phase: Phase, notice: Notice) {
+    let had_guest = ctx.session.guest.take().is_some();
+    let session = &mut ctx.session;
+    session.phase = phase;
+    session.recording = None;
+    session.helper_input = DeviceState::new();
+    session.last_sent = None;
+    session.notice = notice;
+    if had_guest {
+        session.pending_switch = Some(STATE_HOME_WORLD);
+    }
 }
 
-// Seeds a fresh world for both players and sends the friend everything they need to follow it
+fn go_offline<H: Host>(ctx: &mut Ctx<H>, notice: Notice) {
+    ctx.host.net_close();
+    friend_left(ctx, Phase::Offline, notice);
+}
+
+// Seeds a fresh world holding both crunchlings and sends the friend everything they need to follow it
 fn start_as_host<H: Host>(ctx: &mut Ctx<H>) {
     let Some(code) = ctx.session.code().map(str::to_string) else { return };
+    let Some(guest) = ctx.session.guest.clone() else { return };
     let session = &mut ctx.session;
     session.epoch += 1;
     session.seq = 0;
     let seed = ctx.host.unix_time().wrapping_mul(0x9e37_79b1) ^ ctx.host.time_ms().rotate_left(7) ^ session.epoch;
-    let start = Message::Start {
-        epoch: session.epoch,
-        seed,
-        player: ctx.player.clone(),
-        helper_name: session.helper_name.clone(),
-    };
+    let start = Message::Start { epoch: session.epoch, seed, host: ctx.player.clone(), guest };
     ctx.host.net_send(&wire::encode(&start));
     ctx.rand.srand(seed);
     session.phase = Phase::HostPlaying { code };
@@ -467,16 +478,17 @@ fn start_as_host<H: Host>(ctx: &mut Ctx<H>) {
     session.pending_switch = Some(STATE_HOME_WORLD);
 }
 
-// Takes over the host's crunchling and seed, keeping this player's own save aside until they leave
-fn begin_joined<H: Host>(ctx: &mut Ctx<H>, epoch: u32, seed: u32, player: PlayerData) {
+// Simulates the host's world with the host's crunchling resident and this player's own as the guest
+fn begin_joined<H: Host>(ctx: &mut Ctx<H>, epoch: u32, seed: u32, host: PlayerData, guest: PlayerData) {
     let Some(code) = ctx.session.code().map(str::to_string) else { return };
     if ctx.session.stash.is_none() {
-        ctx.session.stash = Some(Stash { player: ctx.player.clone(), globals: ctx.globals.clone() });
+        ctx.session.stash = Some(ctx.globals.clone());
     }
-    ctx.player = player;
+    ctx.player = host;
     ctx.globals.player_loaded = true;
     ctx.rand.srand(seed);
     let session = &mut ctx.session;
+    session.guest = Some(guest);
     session.epoch = epoch;
     session.seq = 0;
     session.queue.clear();
@@ -491,13 +503,15 @@ fn begin_joined<H: Host>(ctx: &mut Ctx<H>, epoch: u32, seed: u32, player: Player
     session.pending_switch = Some(STATE_HOME_WORLD);
 }
 
-// Gives this player their own crunchling back and sends them home, showing why when asked
+// Brings this player's crunchling home with everything that happened to it and shows why when asked
 fn end_joined<H: Host>(ctx: &mut Ctx<H>, notice: Notice, show: bool) {
     ctx.host.net_close();
+    if let Some(own) = ctx.session.guest.take() {
+        ctx.player = own;
+    }
     if let Some(stash) = ctx.session.stash.take() {
-        ctx.player = stash.player;
-        ctx.globals.player_loaded = stash.globals.player_loaded;
-        ctx.globals.save_name = stash.globals.save_name;
+        ctx.globals.player_loaded = stash.player_loaded;
+        ctx.globals.save_name = stash.save_name;
     }
     let session = &mut ctx.session;
     session.phase = Phase::Offline;
@@ -537,7 +551,7 @@ pub fn cancel<H: Host>(ctx: &mut Ctx<H>) {
     }
 }
 
-// Ends the session on purpose, the host playing on alone and the helper returning to their own world
+// Ends the session on purpose, the host playing on alone and the guest returning to their own world
 pub fn leave<H: Host>(ctx: &mut Ctx<H>) {
     match ctx.session.phase {
         Phase::HostWaiting { .. } | Phase::HostPlaying { .. } => {
@@ -558,7 +572,7 @@ pub fn host_quit<H: Host>(ctx: &mut Ctx<H>) {
     end_joined(ctx, Notice::HostLeft, true);
 }
 
-// Tells the friend goodbye and restores this player's own save before the game saves it
+// Tells the friend goodbye and restores this player's own crunchling before the game saves it
 pub fn shutdown<H: Host>(ctx: &mut Ctx<H>) {
     match ctx.session.phase {
         Phase::Offline => {}
@@ -628,5 +642,17 @@ mod tests {
         assert_eq!(session.replay_bool(), None);
         assert!(session.replay_overrun);
         assert_eq!(session.time_ms(99), 5);
+    }
+
+    #[test]
+    fn guest_name_is_empty_without_a_friend() {
+        let mut session = Session::new();
+        assert_eq!(session.guest_name(), "");
+        let mut mate = PlayerData::default();
+        mate.set_name("MATE");
+        session.guest = Some(mate);
+        assert_eq!(session.guest_name(), "MATE");
+        assert_eq!(session.guest_mut().map(|g| g.happiness += 1), Some(()));
+        assert_eq!(session.guest().map(|g| g.happiness), Some(1));
     }
 }

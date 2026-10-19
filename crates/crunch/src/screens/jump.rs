@@ -1,27 +1,19 @@
 use avmanager::anim::{STATE_RESTART_FORWARD, STATE_STOPPED};
 use avmanager::crt::ftol;
-use avmanager::texture::Palette24;
 
 use crate::actors::{
     ACTOR_FLAG_FINISH, ACTOR_FLAG_PICKUP, EVENT_ANIM_END, EVENT_FINISH, EVENT_GROUND_REACHED, EVENT_INIT_OBJECT,
     EVENT_PICKUP, EVENT_UNATTACHED, FACING_LEFT, FACING_NONE, FACING_RIGHT,
 };
 use crate::ctx::{
-    Ctx, KEY_ESC, KEY_LEFT, KEY_RIGHT, KEY_SPACE, KEY_UP, MOUSE_LEFT, RESULT_CONTINUE, STATE_CHALLENGE, STATE_HOME_WORLD,
-    STATE_JUMPING, Screen,
+    Ctx, Held, KEY_ESC, KEY_SPACE, MOUSE_LEFT, RESULT_CONTINUE, STATE_CHALLENGE, STATE_HOME_WORLD, STATE_JUMPING, Screen,
 };
 use crate::host::Host;
+use crate::online::wins_text;
 use crate::scene::{FLAG_FINISH, FLAG_PICKUP, FLAG_PLATFORM, HOVER_HIDDEN, HOVER_NORMAL};
 use crate::scroll_strip::ScrollStrip;
+use crate::skin::Skin;
 
-const ANIM_STANCE: usize = 0;
-const ANIM_RUNNING_LEFT: usize = 1;
-const ANIM_RUNNING_RIGHT: usize = 2;
-const ANIM_JUMPING_LEFT: usize = 3;
-const ANIM_JUMPING_RIGHT: usize = 4;
-const ANIM_JUMP_TURN_LEFT: usize = 5;
-const ANIM_JUMP_TURN_RIGHT: usize = 6;
-const ANIM_FALLING_LOOP: usize = 7;
 const ANIM_HOVER_FLY: usize = 8;
 const ANIM_CAP_TV_IDLE: usize = 9;
 const ANIM_CAP_TV_TALK: usize = 10;
@@ -36,6 +28,17 @@ const ANIM_TWO: usize = 18;
 const ANIM_ONE: usize = 19;
 const ANIM_GO: usize = 20;
 const ANIM_BERRYBULGE: usize = 21;
+
+// Handle table of one jumper's own crunchling animations
+const J_STANCE: usize = 0;
+const J_RUN_LEFT: usize = 1;
+const J_RUN_RIGHT: usize = 2;
+const J_JUMP_LEFT: usize = 3;
+const J_JUMP_RIGHT: usize = 4;
+const J_TURN_LEFT: usize = 5;
+const J_TURN_RIGHT: usize = 6;
+const J_FALLING: usize = 7;
+const J_COUNT: usize = 8;
 
 const SFX_JUMP: usize = 0;
 const SFX_BERRY: usize = 1;
@@ -56,7 +59,6 @@ const OBJ_DONE: i32 = 6;
 const OBJ_GOOD_JOB: i32 = 7;
 const OBJ_AGAIN: i32 = 8;
 
-const PLAYER_NONE: i32 = 0;
 const PLAYER_STANDING: i32 = 1;
 const PLAYER_RUNNING: i32 = 2;
 const PLAYER_AIRBORNE: i32 = 3;
@@ -93,42 +95,81 @@ const BONUS_BERRIES: u32 = 4;
 const JUMP_GRAVITY: f32 = 1.2;
 const MAX_FALL_SPEED: f32 = 14.0;
 const SCREEN_HEIGHT: i32 = 480;
+const PLAYER_START_X: f32 = 280.0;
+const GUEST_START_X: f32 = 360.0;
+const LEFT_EDGE: f32 = 30.0;
+const RIGHT_EDGE: f32 = 560.0;
 
-// Jumping mini game, state 0xc, with its tall scrolling level and the Underground thief race
+// Height gap that leaves one friend out of frame and hands the climb to the higher one
+const VERSUS_GAP_LIMIT: f32 = 380.0;
+
+// One climbing crunchling, the resident one or the visiting friend's, with its anims and run state
+#[derive(Clone, Copy, Debug, Default)]
+struct Jumper {
+    actor: i32,
+    friend: bool,
+    anims: [u16; J_COUNT],
+    state: i32,
+    vx: f32,
+    max_run_speed: f32,
+    jump_power: f32,
+    drop: f32,
+    start_x: f32,
+    fall_frames: u32,
+    berries: u32,
+    berry_streak: u32,
+    finished: bool,
+}
+
+impl Jumper {
+    // Top running speed of a form, six for babies, eight for teens and ten for adults
+    fn run_speed(stage: u16) -> f32 {
+        match stage {
+            0 => 6.0,
+            1 => 8.0,
+            _ => 10.0,
+        }
+    }
+
+    // Upward launch speed from the jumping stat
+    fn launch(jumping: i32) -> f32 {
+        (-(jumping as f64 * 0.5 + 15.0)) as f32
+    }
+
+    fn racing(&self) -> bool {
+        matches!(self.state, PLAYER_STANDING | PLAYER_RUNNING | PLAYER_AIRBORNE)
+    }
+}
+
+// Jumping mini game, state 0xc, with its tall scrolling level, the thief race and the friend climb
 #[derive(Clone, Debug, Default)]
 pub struct JumpScreen {
     cursor_anim: u16,
     anims: [u16; 22],
     sfx: [u16; 3],
+    jumpers: Vec<Jumper>,
     backdrop: ScrollStrip,
     music: u32,
     voice: u32,
     max_scroll_y: i32,
-    player_state: i32,
     capn_state: i32,
     thief_state: i32,
-    max_run_speed: f32,
-    run_accel: f32,
-    vx: f32,
     ground_y: f32,
-    berries: u32,
     last_time: u32,
     time_frac: f32,
     time_secs: u16,
     timer_reset: bool,
     countdown: u32,
-    finished: bool,
     thief_y: f32,
     result: i32,
+    winner: Option<usize>,
     intro_pending: bool,
     outro_active: bool,
     challenge: i32,
     capn_fly_state: i32,
-    fall_frames: u32,
     fly_y: f32,
     base_y: f32,
     end_delay: u32,
-    berry_streak: u32,
 }
 
 // Actor flag word for a level object, pickup wins over finish line over plain platform
@@ -147,6 +188,17 @@ fn platform_flags(scene_flags: u32) -> u32 {
 // Text the time objects show, seconds then two digit hundredths
 fn time_text(secs: u16, hundredths: i32) -> String {
     format!(" {secs}.{hundredths:02}")
+}
+
+// Who a height gap too tall for one screen hands the climb to, None while both are in frame
+fn left_behind(y0: f32, y1: f32) -> Option<usize> {
+    if y1 - y0 > VERSUS_GAP_LIMIT {
+        Some(0)
+    } else if y0 - y1 > VERSUS_GAP_LIMIT {
+        Some(1)
+    } else {
+        None
+    }
 }
 
 // Pixels the Cap'n and TV move per frame by how far along the intro flight they are
@@ -206,29 +258,40 @@ impl JumpScreen {
         Self::default()
     }
 
-    // Loads the crunchling strip through the stance palette and every shared animation
-    async fn load_anims<H: Host>(&mut self, ctx: &mut Ctx<H>) -> bool {
-        let name = ctx.player.anim_name("stance", false, false);
-        let Some(stance) = ctx.av.get_anim_retain_image(&mut ctx.host, &name).await else { return false };
-        self.anims[ANIM_STANCE] = stance;
-        let mut pal = Palette24::default();
-        ctx.av.get_anim_palette(stance, &mut pal);
-        ctx.player.recolor_palette(&mut pal);
-        ctx.av.set_anim_palette(stance, &pal);
-        let crunchling = [
-            (ANIM_RUNNING_LEFT, "running_left"),
-            (ANIM_RUNNING_RIGHT, "running_right"),
-            (ANIM_JUMPING_LEFT, "jumping_left"),
-            (ANIM_JUMPING_RIGHT, "jumping_right"),
-            (ANIM_JUMP_TURN_LEFT, "jump_turn_left"),
-            (ANIM_JUMP_TURN_RIGHT, "jump_turn_right"),
-            (ANIM_FALLING_LOOP, "falling_loop"),
+    // True while the resident crunchling climbs against the visiting friend's rather than the thief
+    fn versus(&self) -> bool {
+        self.jumpers.len() == 2
+    }
+
+    fn jumper_index(&self, actor: i32) -> Option<usize> {
+        self.jumpers.iter().position(|j| j.actor == actor)
+    }
+
+    // Loads a jumper's eight crunchling animations through its own recoloured palette
+    async fn load_jumper<H: Host>(ctx: &mut Ctx<H>, skin: Skin<'_>, actor: i32, friend: bool, start_x: f32) -> Option<Jumper> {
+        let (stance, pal) = skin.palette(&mut ctx.av, &mut ctx.host, "stance", false, false).await?;
+        let mut jumper = Jumper { actor, friend, start_x, ..Jumper::default() };
+        jumper.anims[J_STANCE] = stance;
+        let suffixes = [
+            (J_RUN_LEFT, "running_left"),
+            (J_RUN_RIGHT, "running_right"),
+            (J_JUMP_LEFT, "jumping_left"),
+            (J_JUMP_RIGHT, "jumping_right"),
+            (J_TURN_LEFT, "jump_turn_left"),
+            (J_TURN_RIGHT, "jump_turn_right"),
+            (J_FALLING, "falling_loop"),
         ];
-        for (slot, suffix) in crunchling {
-            let name = ctx.player.anim_name(suffix, false, false);
-            let Some(h) = ctx.av.get_anim_use_palette(&mut ctx.host, &name, &pal).await else { return false };
-            self.anims[slot] = h;
+        for (slot, suffix) in suffixes {
+            jumper.anims[slot] = skin.anim(&mut ctx.av, &mut ctx.host, suffix, false, false, &pal).await?;
         }
+        jumper.max_run_speed = Jumper::run_speed(skin.data.shown_stage());
+        jumper.jump_power = Jumper::launch(skin.data.jumping);
+        jumper.drop = drop_height(skin.data.shown_stage());
+        Some(jumper)
+    }
+
+    // Loads every shared animation
+    async fn load_anims<H: Host>(&mut self, ctx: &mut Ctx<H>) -> bool {
         let shared = [
             (ANIM_BERRYBULGE, "berrybulge"),
             (ANIM_HOVER_FLY, "hover_fly"),
@@ -252,6 +315,7 @@ impl JumpScreen {
     // Handles a click on a scene object, done rewards and leaves, Again rewards and restarts
     fn on_mouse_hit<H: Host>(&mut self, ctx: &mut Ctx<H>, id: i32) -> u32 {
         let mut ret = RESULT_CONTINUE;
+        let berries = self.jumpers[0].berries;
         if id == OBJ_DONE {
             if ctx.player.food != 0 {
                 ctx.player.food -= 1;
@@ -260,13 +324,13 @@ impl JumpScreen {
                 ctx.player.happiness -= 1;
             }
             ctx.player.add_stats(0, 0, 1);
-            if BONUS_BERRIES < self.berries {
+            if BONUS_BERRIES < berries {
                 ctx.player.add_stats(0, 0, 1);
             }
             ret = STATE_HOME_WORLD;
         } else if id == OBJ_AGAIN {
             ctx.player.add_stats(0, 0, 1);
-            if BONUS_BERRIES < self.berries {
+            if BONUS_BERRIES < berries {
                 ctx.player.add_stats(0, 0, 1);
             }
             ret = STATE_JUMPING;
@@ -279,71 +343,92 @@ impl JumpScreen {
         match kind {
             EVENT_INIT_OBJECT => self.on_init_object(ctx, actor),
             EVENT_ANIM_END => self.on_anim_end(ctx, actor),
-            EVENT_GROUND_REACHED if actor == ACTOR_PLAYER && self.player_state == PLAYER_AIRBORNE => {
-                let stance = self.anims[ANIM_STANCE];
-                ctx.actors.set_anims(&ctx.av, ACTOR_PLAYER, stance, stance, false, STATE_RESTART_FORWARD);
-                self.player_state = PLAYER_STANDING;
-                ctx.av.play_sfx(self.sfx[SFX_LAND], -1);
+            EVENT_GROUND_REACHED => {
+                if let Some(i) = self.jumper_index(actor)
+                    && self.jumpers[i].state == PLAYER_AIRBORNE
+                {
+                    let j = &mut self.jumpers[i];
+                    let stance = j.anims[J_STANCE];
+                    ctx.actors.set_anims(&ctx.av, actor, stance, stance, false, STATE_RESTART_FORWARD);
+                    j.state = PLAYER_STANDING;
+                    ctx.av.play_sfx(self.sfx[SFX_LAND], -1);
+                }
             }
-            EVENT_UNATTACHED if actor == ACTOR_PLAYER => {
-                let falling = self.anims[ANIM_FALLING_LOOP];
-                ctx.actors.set_anims(&ctx.av, ACTOR_PLAYER, falling, falling, false, STATE_RESTART_FORWARD);
-                let ground = ftol(self.ground_y as f64);
-                ctx.actors.set_gravity(ACTOR_PLAYER, 0.0, JUMP_GRAVITY, ground, MAX_FALL_SPEED);
-                self.player_state = PLAYER_AIRBORNE;
+            EVENT_UNATTACHED => {
+                if let Some(i) = self.jumper_index(actor) {
+                    let j = &mut self.jumpers[i];
+                    let falling = j.anims[J_FALLING];
+                    ctx.actors.set_anims(&ctx.av, actor, falling, falling, false, STATE_RESTART_FORWARD);
+                    let ground = ftol(self.ground_y as f64);
+                    ctx.actors.set_gravity(actor, 0.0, JUMP_GRAVITY, ground, MAX_FALL_SPEED);
+                    j.state = PLAYER_AIRBORNE;
+                }
             }
             EVENT_PICKUP => {
-                self.berries += 1;
-                self.berry_streak += 1;
-                if PRAISE_STREAK < self.berry_streak {
-                    self.berry_streak = 0;
-                    if self.capn_state == CAPN_IDLE {
-                        let talk = self.anims[ANIM_CAP_TV_TALK];
-                        ctx.actors.set_anims(&ctx.av, ACTOR_CAPN, talk, talk, false, STATE_RESTART_FORWARD);
-                        if ctx.rand_range(0, 2) == 0 {
-                            self.voice = ctx.av.play_stream_sound(&mut ctx.host, "052.wav", false, self.voice).await;
-                        } else {
-                            self.voice = ctx.av.play_stream_sound(&mut ctx.host, "053.wav", false, self.voice).await;
+                if let Some(i) = self.jumper_index(actor) {
+                    self.jumpers[i].berries += 1;
+                    self.jumpers[i].berry_streak += 1;
+                    if PRAISE_STREAK < self.jumpers[i].berry_streak {
+                        self.jumpers[i].berry_streak = 0;
+                        if self.capn_state == CAPN_IDLE {
+                            let talk = self.anims[ANIM_CAP_TV_TALK];
+                            ctx.actors.set_anims(&ctx.av, ACTOR_CAPN, talk, talk, false, STATE_RESTART_FORWARD);
+                            if ctx.rand_range(0, 2) == 0 {
+                                self.voice = ctx.av.play_stream_sound(&mut ctx.host, "052.wav", false, self.voice).await;
+                            } else {
+                                self.voice = ctx.av.play_stream_sound(&mut ctx.host, "053.wav", false, self.voice).await;
+                            }
+                            self.capn_state = CAPN_TALKING;
                         }
-                        self.capn_state = CAPN_TALKING;
                     }
+                    ctx.av.play_sfx(self.sfx[SFX_BERRY], -1);
                 }
-                ctx.av.play_sfx(self.sfx[SFX_BERRY], -1);
             }
-            EVENT_FINISH => self.finished = true,
+            EVENT_FINISH => {
+                if let Some(i) = self.jumper_index(actor) {
+                    self.jumpers[i].finished = true;
+                }
+            }
             _ => {}
         }
     }
 
-    // Places the thief, player, Cap'n, TV and countdown digits on their first frame
+    // Stands a jumper on its mark, or drops it in from above when no intro flight precedes the climb
+    fn init_jumper<H: Host>(&mut self, ctx: &mut Ctx<H>, i: usize) {
+        let j = &mut self.jumpers[i];
+        let actor = j.actor;
+        j.state = PLAYER_STANDING;
+        let stance = j.anims[J_STANCE];
+        ctx.actors.set_anims(&ctx.av, actor, stance, stance, false, STATE_RESTART_FORWARD);
+        ctx.actors.set_turn_anims(actor, j.anims[J_TURN_RIGHT], j.anims[J_TURN_LEFT]);
+        ctx.actors.set_pos(actor, j.start_x, self.ground_y);
+        ctx.actors.face(&ctx.av, actor, FACING_NONE);
+        ctx.actors.set_bbox_anim(actor, stance);
+        if !self.intro_pending {
+            j.state = PLAYER_AIRBORNE;
+            ctx.actors.set_visible(actor, true);
+            ctx.actors.set_pos(actor, j.start_x, j.drop + self.ground_y);
+            let falling = j.anims[J_FALLING];
+            ctx.actors.set_anims(&ctx.av, actor, falling, falling, false, STATE_RESTART_FORWARD);
+            let ground = ftol(self.ground_y as f64);
+            ctx.actors.set_gravity(actor, 1.0, 1.0, ground, MAX_FALL_SPEED);
+        } else {
+            ctx.actors.set_visible(actor, false);
+        }
+    }
+
+    // Places the thief or guest, player, Cap'n, TV and countdown digits on their first frame
     fn on_init_object<H: Host>(&mut self, ctx: &mut Ctx<H>, actor: i32) {
+        if let Some(i) = self.jumper_index(actor) {
+            self.init_jumper(ctx, i);
+            return;
+        }
         match actor {
             ACTOR_THIEF => {
                 self.thief_state = THIEF_STOPPED;
                 let climb = self.anims[ANIM_THIEF_CLIMB_A];
                 ctx.actors.set_anims(&ctx.av, actor, climb, climb, false, STATE_STOPPED);
                 ctx.actors.set_pos(actor, 312.0, self.thief_y);
-            }
-            ACTOR_PLAYER => {
-                self.player_state = PLAYER_STANDING;
-                let stance = self.anims[ANIM_STANCE];
-                ctx.actors.set_anims(&ctx.av, actor, stance, stance, false, STATE_RESTART_FORWARD);
-                ctx.actors.set_turn_anims(actor, self.anims[ANIM_JUMP_TURN_RIGHT], self.anims[ANIM_JUMP_TURN_LEFT]);
-                ctx.actors.set_pos(actor, 280.0, self.ground_y);
-                ctx.actors.face(&ctx.av, actor, FACING_NONE);
-                ctx.actors.set_bbox_anim(actor, stance);
-                if !self.intro_pending {
-                    let drop = drop_height(ctx.player.stage);
-                    self.player_state = PLAYER_AIRBORNE;
-                    ctx.actors.set_visible(actor, true);
-                    ctx.actors.set_pos(actor, 280.0, drop + self.ground_y);
-                    let falling = self.anims[ANIM_FALLING_LOOP];
-                    ctx.actors.set_anims(&ctx.av, actor, falling, falling, false, STATE_RESTART_FORWARD);
-                    let ground = ftol(self.ground_y as f64);
-                    ctx.actors.set_gravity(actor, 1.0, 1.0, ground, MAX_FALL_SPEED);
-                } else {
-                    ctx.actors.set_visible(actor, false);
-                }
             }
             ACTOR_CAPN => {
                 if !self.intro_pending {
@@ -375,7 +460,140 @@ impl JumpScreen {
         }
     }
 
-    // Finish bookkeeping, thief climb, jump, steering, movement and the clock while the race runs
+    // Settles the resident climber's finish against the thief, with times and buttons outside a challenge
+    fn solo_finish<H: Host>(&mut self, ctx: &mut Ctx<H>) {
+        if !self.jumpers[0].finished {
+            return;
+        }
+        if self.result == RESULT_UNDECIDED {
+            self.result = RESULT_PLAYER_FIRST;
+            if self.thief_y <= 100.0 {
+                self.result = RESULT_THIEF_FIRST;
+            }
+        }
+        if self.jumpers[0].state == PLAYER_STANDING {
+            self.jumpers[0].state = PLAYER_FINISHED;
+            if ctx.player.challenge_active == 0 {
+                ctx.actors.set_visible(ACTOR_CAPN, false);
+                self.capn_fly_state = FLY_START;
+                self.outro_active = true;
+                let old_best = time_text(ctx.player.jump_best_secs, ctx.player.jump_best_frac as u16 as i32);
+                if self.time_secs < ctx.player.jump_best_secs
+                    || (ctx.player.jump_best_secs == self.time_secs
+                        && self.time_frac as f64 * 5.0 < (ctx.player.jump_best_frac as u16) as f64)
+                {
+                    ctx.player.jump_best_secs = self.time_secs;
+                    ctx.player.jump_best_frac = (ftol(self.time_frac as f64) * 5) as i16;
+                }
+                ctx.scene.set_text_by_id(OBJ_BEST_TIME, &old_best);
+                ctx.scene.set_hover_by_id(OBJ_BEST_TITLE, HOVER_NORMAL);
+                ctx.scene.set_hover_by_id(OBJ_BEST_TIME, HOVER_NORMAL);
+                ctx.scene.set_hover_by_id(OBJ_DONE, HOVER_NORMAL);
+                ctx.scene.set_hover_by_id(OBJ_AGAIN, HOVER_NORMAL);
+                self.jumpers[0].vx = 0.0;
+                ctx.cursor.set_visible(true);
+            } else if self.result == RESULT_PLAYER_FIRST {
+                ctx.scene.set_hover_by_id(OBJ_GOOD_JOB, HOVER_NORMAL);
+            }
+        }
+        self.timer_reset = true;
+    }
+
+    // Decides a friend climb at the top platform or a lead of a screen and holds both once they land
+    fn versus_finish<H: Host>(&mut self, ctx: &mut Ctx<H>) {
+        if self.winner.is_none() {
+            let y0 = ctx.actors.pos(self.jumpers[0].actor).1;
+            let y1 = ctx.actors.pos(self.jumpers[1].actor).1;
+            let heights = [y0, y1];
+            let done: Vec<usize> = (0..2).filter(|&i| self.jumpers[i].finished).collect();
+            self.winner = done.into_iter().min_by(|&x, &y| heights[x].total_cmp(&heights[y]));
+            if self.winner.is_none() {
+                self.winner = left_behind(y0, y1);
+            }
+            if let Some(w) = self.winner {
+                self.result = if w == 0 { RESULT_PLAYER_FIRST } else { RESULT_THIEF_FIRST };
+                let name = if w == 0 { ctx.player.name_str() } else { ctx.session.guest_name() };
+                ctx.scene.set_text_by_id(OBJ_GOOD_JOB, &wins_text(&name));
+                ctx.scene.set_hover_by_id(OBJ_GOOD_JOB, HOVER_NORMAL);
+            }
+        }
+        if self.winner.is_some() {
+            for j in &mut self.jumpers {
+                if j.state == PLAYER_STANDING {
+                    j.state = PLAYER_FINISHED;
+                    j.vx = 0.0;
+                }
+            }
+            self.timer_reset = true;
+        }
+    }
+
+    // Jumps, runs and steers one climber by the keys its side holds, and worries the Cap'n on long falls
+    fn jumper_input<H: Host>(&mut self, ctx: &mut Ctx<H>, i: usize, held: Held) {
+        let decided = self.winner.is_some();
+        let held = if decided && self.jumpers[i].racing() { Held::default() } else { held };
+        let j = &mut self.jumpers[i];
+        let actor = j.actor;
+        if (j.state == PLAYER_STANDING || j.state == PLAYER_RUNNING) && held.space {
+            ctx.av.play_sfx(self.sfx[SFX_JUMP], -1);
+            ctx.actors.set_anims(&ctx.av, actor, j.anims[J_JUMP_RIGHT], j.anims[J_JUMP_LEFT], false, STATE_RESTART_FORWARD);
+            let ground = ftol(self.ground_y as f64);
+            ctx.actors.set_gravity(actor, j.jump_power, JUMP_GRAVITY, ground, MAX_FALL_SPEED);
+            j.state = PLAYER_AIRBORNE;
+        }
+        if j.racing() {
+            if held.right {
+                ctx.actors.face(&ctx.av, actor, FACING_RIGHT);
+                if j.vx < 0.0 && j.state != PLAYER_AIRBORNE {
+                    j.vx = 0.0;
+                }
+                j.vx += 1.0;
+                if j.max_run_speed < j.vx {
+                    j.vx = j.max_run_speed;
+                }
+            } else if held.left {
+                ctx.actors.face(&ctx.av, actor, FACING_LEFT);
+                if 0.0 < j.vx && j.state != PLAYER_AIRBORNE {
+                    j.vx = 0.0;
+                }
+                j.vx -= 1.0;
+                if j.vx < -j.max_run_speed {
+                    j.vx = -j.max_run_speed;
+                }
+            } else if j.state == PLAYER_STANDING || j.state == PLAYER_RUNNING {
+                if j.state != PLAYER_STANDING {
+                    let stance = j.anims[J_STANCE];
+                    ctx.actors.set_anims(&ctx.av, actor, stance, stance, false, STATE_RESTART_FORWARD);
+                    ctx.actors.face(&ctx.av, actor, FACING_NONE);
+                    j.state = PLAYER_STANDING;
+                }
+                j.vx = 0.0;
+            }
+            if j.vx != 0.0 && j.state == PLAYER_STANDING {
+                ctx.actors.set_anims(&ctx.av, actor, j.anims[J_RUN_RIGHT], j.anims[J_RUN_LEFT], false, STATE_RESTART_FORWARD);
+                j.state = PLAYER_RUNNING;
+            }
+            let vy = ctx.actors.vel_y(actor);
+            if vy < MAX_FALL_SPEED {
+                j.fall_frames = 0;
+            } else {
+                j.fall_frames += 1;
+                if FALL_WARNING_FRAMES < j.fall_frames && self.capn_state != CAPN_TALKING && self.capn_state != CAPN_WORRIED {
+                    let worried = self.anims[ANIM_CAP_TV_WORRIED];
+                    ctx.actors.set_anims(&ctx.av, ACTOR_CAPN, worried, worried, true, STATE_RESTART_FORWARD);
+                    self.capn_state = CAPN_WORRIED;
+                }
+            }
+        }
+        if j.vx != 0.0 && !j.finished {
+            let (mut x, _y) = ctx.actors.pos(actor);
+            x += j.vx;
+            x = x.clamp(LEFT_EDGE, RIGHT_EDGE);
+            ctx.actors.set_x(actor, x);
+        }
+    }
+
+    // Finish bookkeeping, thief climb, both climbers' input and the clock while the race runs
     fn update_race<H: Host>(&mut self, ctx: &mut Ctx<H>) {
         if self.countdown != 0 {
             self.countdown -= 1;
@@ -383,45 +601,14 @@ impl JumpScreen {
                 ctx.actors.set_visible(ACTOR_COUNTDOWN, false);
             }
         }
-        if self.finished {
-            if self.result == RESULT_UNDECIDED {
-                self.result = RESULT_PLAYER_FIRST;
-                if self.thief_y <= 100.0 {
-                    self.result = RESULT_THIEF_FIRST;
-                }
-            }
-            if self.player_state == PLAYER_STANDING {
-                self.player_state = PLAYER_FINISHED;
-                if ctx.player.challenge_active == 0 {
-                    ctx.actors.set_visible(ACTOR_CAPN, false);
-                    self.capn_fly_state = FLY_START;
-                    self.outro_active = true;
-                    let old_best = time_text(ctx.player.jump_best_secs, ctx.player.jump_best_frac as u16 as i32);
-                    if self.time_secs < ctx.player.jump_best_secs
-                        || (ctx.player.jump_best_secs == self.time_secs
-                            && self.time_frac as f64 * 5.0 < (ctx.player.jump_best_frac as u16) as f64)
-                    {
-                        ctx.player.jump_best_secs = self.time_secs;
-                        ctx.player.jump_best_frac = (ftol(self.time_frac as f64) * 5) as i16;
-                    }
-                    ctx.scene.set_text_by_id(OBJ_BEST_TIME, &old_best);
-                    ctx.scene.set_hover_by_id(OBJ_BEST_TITLE, HOVER_NORMAL);
-                    ctx.scene.set_hover_by_id(OBJ_BEST_TIME, HOVER_NORMAL);
-                    ctx.scene.set_hover_by_id(OBJ_DONE, HOVER_NORMAL);
-                    ctx.scene.set_hover_by_id(OBJ_AGAIN, HOVER_NORMAL);
-                    self.vx = 0.0;
-                    ctx.cursor.set_visible(true);
-                } else if self.result == RESULT_PLAYER_FIRST {
-                    ctx.scene.set_hover_by_id(OBJ_GOOD_JOB, HOVER_NORMAL);
-                }
-            }
-            self.timer_reset = true;
+        if self.versus() {
+            self.versus_finish(ctx);
+        } else {
+            self.solo_finish(ctx);
         }
-        if self.challenge != 0 {
+        if self.challenge != 0 && !self.versus() {
             let climb = self.anims[ANIM_THIEF_CLIMB_B];
-            let friend_holds = ctx.helper_key_down(KEY_SPACE) || ctx.helper_key_down(KEY_UP);
-            let climbing = self.thief_y > 100.0 && (!ctx.session.helper_present() || friend_holds);
-            if climbing {
+            if self.thief_y > 100.0 {
                 if self.thief_state == THIEF_STOPPED {
                     ctx.actors.set_anims(&ctx.av, ACTOR_THIEF, climb, climb, false, STATE_RESTART_FORWARD);
                     self.thief_state = THIEF_CLIMBING;
@@ -434,83 +621,9 @@ impl JumpScreen {
                 self.thief_state = THIEF_STOPPED;
             }
         }
-        if (self.player_state == PLAYER_STANDING || self.player_state == PLAYER_RUNNING) && ctx.av.is_key_down(KEY_SPACE) {
-            ctx.av.play_sfx(self.sfx[SFX_JUMP], -1);
-            ctx.actors.set_anims(
-                &ctx.av,
-                ACTOR_PLAYER,
-                self.anims[ANIM_JUMPING_RIGHT],
-                self.anims[ANIM_JUMPING_LEFT],
-                false,
-                STATE_RESTART_FORWARD,
-            );
-            let ground = ftol(self.ground_y as f64);
-            let vy = (-(ctx.player.jumping as f64 * 0.5 + 15.0)) as f32;
-            ctx.actors.set_gravity(ACTOR_PLAYER, vy, JUMP_GRAVITY, ground, MAX_FALL_SPEED);
-            self.player_state = PLAYER_AIRBORNE;
-        }
-        if self.player_state == PLAYER_STANDING || self.player_state == PLAYER_AIRBORNE || self.player_state == PLAYER_RUNNING {
-            if ctx.av.is_key_down(KEY_RIGHT) {
-                ctx.actors.face(&ctx.av, ACTOR_PLAYER, FACING_RIGHT);
-                if self.vx < 0.0 && self.player_state != PLAYER_AIRBORNE {
-                    self.vx = 0.0;
-                }
-                self.vx += self.run_accel;
-                if self.max_run_speed < self.vx {
-                    self.vx = self.max_run_speed;
-                }
-            } else if ctx.av.is_key_down(KEY_LEFT) {
-                ctx.actors.face(&ctx.av, ACTOR_PLAYER, FACING_LEFT);
-                if 0.0 < self.vx && self.player_state != PLAYER_AIRBORNE {
-                    self.vx = 0.0;
-                }
-                self.vx -= self.run_accel;
-                if self.vx < -self.max_run_speed {
-                    self.vx = -self.max_run_speed;
-                }
-            } else if self.player_state == PLAYER_STANDING || self.player_state == PLAYER_RUNNING {
-                if self.player_state != PLAYER_STANDING {
-                    let stance = self.anims[ANIM_STANCE];
-                    ctx.actors.set_anims(&ctx.av, ACTOR_PLAYER, stance, stance, false, STATE_RESTART_FORWARD);
-                    ctx.actors.face(&ctx.av, ACTOR_PLAYER, FACING_NONE);
-                    self.player_state = PLAYER_STANDING;
-                }
-                self.vx = 0.0;
-            }
-            if self.vx != 0.0 && self.player_state == PLAYER_STANDING {
-                ctx.actors.set_anims(
-                    &ctx.av,
-                    ACTOR_PLAYER,
-                    self.anims[ANIM_RUNNING_RIGHT],
-                    self.anims[ANIM_RUNNING_LEFT],
-                    false,
-                    STATE_RESTART_FORWARD,
-                );
-                self.player_state = PLAYER_RUNNING;
-            }
-            let vy = ctx.actors.vel_y(ACTOR_PLAYER);
-            if vy < MAX_FALL_SPEED {
-                self.fall_frames = 0;
-            } else {
-                self.fall_frames += 1;
-                if FALL_WARNING_FRAMES < self.fall_frames && self.capn_state != CAPN_TALKING && self.capn_state != CAPN_WORRIED {
-                    let worried = self.anims[ANIM_CAP_TV_WORRIED];
-                    ctx.actors.set_anims(&ctx.av, ACTOR_CAPN, worried, worried, true, STATE_RESTART_FORWARD);
-                    self.capn_state = CAPN_WORRIED;
-                }
-            }
-        }
-        if self.vx != 0.0 && !self.finished {
-            let (mut x, _y) = ctx.actors.pos(ACTOR_PLAYER);
-            x += self.vx;
-            if x <= 560.0 {
-                if x < 30.0 {
-                    x = 30.0;
-                }
-            } else {
-                x = 560.0;
-            }
-            ctx.actors.set_x(ACTOR_PLAYER, x);
+        for i in 0..self.jumpers.len() {
+            let held = ctx.held(self.jumpers[i].friend);
+            self.jumper_input(ctx, i, held);
         }
         let now = ctx.time_ms();
         let mut dt = now.wrapping_sub(self.last_time) as f32;
@@ -547,8 +660,10 @@ impl JumpScreen {
         if self.countdown == COUNTDOWN_ACTIVE {
             let go = self.anims[ANIM_GO];
             ctx.actors.set_anims(&ctx.av, ACTOR_COUNTDOWN, go, go, false, STATE_STOPPED);
-            let stance = self.anims[ANIM_STANCE];
-            ctx.actors.set_anims(&ctx.av, ACTOR_PLAYER, stance, stance, false, STATE_RESTART_FORWARD);
+            for j in &self.jumpers {
+                let stance = j.anims[J_STANCE];
+                ctx.actors.set_anims(&ctx.av, j.actor, stance, stance, false, STATE_RESTART_FORWARD);
+            }
             ctx.scene.set_hover_by_id(OBJ_TIME, HOVER_NORMAL);
             ctx.scene.set_hover_by_id(OBJ_TIME_TITLE, HOVER_NORMAL);
         } else if self.countdown == COUNTDOWN_ONE {
@@ -616,14 +731,14 @@ impl JumpScreen {
             ctx.actors.set_draw_offset(ACTOR_CAPN, 0, 0);
         }
         if arrived {
-            let drop = drop_height(ctx.player.stage);
-            self.player_state = PLAYER_AIRBORNE;
-            ctx.actors.set_visible(ACTOR_PLAYER, true);
-            ctx.actors.set_pos(ACTOR_PLAYER, 280.0, drop + self.ground_y);
-            let falling = self.anims[ANIM_FALLING_LOOP];
-            ctx.actors.set_anims(&ctx.av, ACTOR_PLAYER, falling, falling, false, STATE_RESTART_FORWARD);
+            let j = &mut self.jumpers[0];
+            j.state = PLAYER_AIRBORNE;
+            ctx.actors.set_visible(j.actor, true);
+            ctx.actors.set_pos(j.actor, j.start_x, j.drop + self.ground_y);
+            let falling = j.anims[J_FALLING];
+            ctx.actors.set_anims(&ctx.av, j.actor, falling, falling, false, STATE_RESTART_FORWARD);
             let ground = ftol(self.ground_y as f64);
-            ctx.actors.set_gravity(ACTOR_PLAYER, 1.0, 1.0, ground, MAX_FALL_SPEED);
+            ctx.actors.set_gravity(j.actor, 1.0, 1.0, ground, MAX_FALL_SPEED);
             self.capn_fly_state = FLY_SPEAKING;
         }
     }
@@ -665,6 +780,22 @@ impl JumpScreen {
         ctx.actors.set_pos(ACTOR_TV, 100.0, self.fly_y);
         ctx.actors.set_pos(ACTOR_CAPN, 100.0, self.fly_y);
     }
+
+    // World y the camera tracks, the resident climber's or the midpoint of both friends
+    fn camera_target<H: Host>(&self, ctx: &Ctx<H>) -> f32 {
+        let (_, y0) = ctx.actors.pos(self.jumpers[0].actor);
+        if self.versus() {
+            let (_, y1) = ctx.actors.pos(self.jumpers[1].actor);
+            (y0 + y1) / 2.0
+        } else {
+            y0
+        }
+    }
+
+    // True once every climber whose result the exit waits on has come to rest
+    fn finished(&self) -> bool {
+        self.jumpers.iter().all(|j| j.state == PLAYER_FINISHED)
+    }
 }
 
 impl<H: Host> Screen<H> for JumpScreen {
@@ -672,6 +803,7 @@ impl<H: Host> Screen<H> for JumpScreen {
     async fn init(&mut self, ctx: &mut Ctx<H>) -> bool {
         self.challenge = ctx.player.challenge_active as i32;
         self.intro_pending = self.challenge == 0;
+        let guest = ctx.session.guest().filter(|_| self.challenge != 0).cloned();
         ctx.actors.clear();
         if self.challenge == 0 {
             if ctx.player.stage == 1 {
@@ -740,52 +872,54 @@ impl<H: Host> Screen<H> for JumpScreen {
         ctx.actors.add_actor(ACTOR_CAPN, true);
         ctx.actors.add_actor(ACTOR_TV, true);
         ctx.actors.add_actor(ACTOR_PLAYER, true);
+        self.ground_y = (bottom - 0x14) as f32;
+        self.thief_y = (bottom - 0x140) as f32;
+        if 0 < ctx.player.jumping {
+            self.intro_pending = false;
+        }
+        self.jumpers.clear();
+        let resident = ctx.player.clone();
+        let Some(player) = Self::load_jumper(ctx, Skin::host(&resident), ACTOR_PLAYER, false, PLAYER_START_X).await
+        else {
+            return false;
+        };
+        self.jumpers.push(player);
+        if let Some(g) = &guest {
+            let Some(rival) = Self::load_jumper(ctx, Skin::guest(g), ACTOR_THIEF, true, GUEST_START_X).await else {
+                return false;
+            };
+            self.jumpers.push(rival);
+        }
         if !self.load_anims(ctx).await {
             return false;
         }
         if self.challenge == 0 {
             self.music = ctx.av.play_stream_sound(&mut ctx.host, "ps56Jumping.wav", true, 0).await;
         } else {
-            let Some(h) = ctx.av.get_anim(&mut ctx.host, "thief_climb_climb").await else { return false };
-            self.anims[ANIM_THIEF_CLIMB_A] = h;
-            let Some(h) = ctx.av.get_anim(&mut ctx.host, "ugjump4pole").await else { return false };
-            self.anims[ANIM_POLE] = h;
-            let Some(h) = ctx.av.get_anim(&mut ctx.host, "thief_climb_climb").await else { return false };
-            self.anims[ANIM_THIEF_CLIMB_B] = h;
+            if guest.is_none() {
+                let Some(h) = ctx.av.get_anim(&mut ctx.host, "thief_climb_climb").await else { return false };
+                self.anims[ANIM_THIEF_CLIMB_A] = h;
+                let Some(h) = ctx.av.get_anim(&mut ctx.host, "ugjump4pole").await else { return false };
+                self.anims[ANIM_POLE] = h;
+                let Some(h) = ctx.av.get_anim(&mut ctx.host, "thief_climb_climb").await else { return false };
+                self.anims[ANIM_THIEF_CLIMB_B] = h;
+            }
             self.music = ctx.av.play_stream_sound(&mut ctx.host, "ps57Challenge.wav", true, 0).await;
         }
-        if ctx.player.stage == 0 {
-            self.max_run_speed = 6.0;
-        } else if ctx.player.stage == 1 {
-            self.max_run_speed = 8.0;
-        } else if ctx.player.stage == 2 {
-            self.max_run_speed = 10.0;
-        }
-        self.run_accel = 1.0;
-        self.vx = 0.0;
-        self.ground_y = (bottom - 0x14) as f32;
-        self.thief_y = (bottom - 0x140) as f32;
-        self.player_state = PLAYER_NONE;
-        self.berries = 0;
         self.time_secs = 0;
         self.time_frac = 0.0;
         self.timer_reset = true;
         self.countdown = COUNTDOWN_START;
-        self.finished = false;
         ctx.cursor.set_visible(false);
-        if 0 < ctx.player.jumping {
-            self.intro_pending = false;
-        }
         self.fly_y = -400.0;
         self.base_y = bottom as f32 - 480.0;
         self.capn_fly_state = FLY_START;
         self.voice = 0;
         self.capn_state = CAPN_NONE;
         self.outro_active = false;
-        self.fall_frames = 0;
         self.end_delay = 0;
         self.result = RESULT_UNDECIDED;
-        self.berry_streak = 0;
+        self.winner = None;
         true
     }
 
@@ -796,7 +930,7 @@ impl<H: Host> Screen<H> for JumpScreen {
         self.backdrop.fill_and_draw(&mut ctx.av, &mut ctx.rand);
         ctx.scene.draw_layer(&mut ctx.av, 0);
         ctx.scene.draw_layer(&mut ctx.av, 2);
-        if self.challenge != 0 {
+        if self.challenge != 0 && !self.versus() {
             ctx.av.draw_anim_reset(self.anims[ANIM_POLE], 0x141, 0);
         }
         if ctx.cursor.visible {
@@ -813,7 +947,9 @@ impl<H: Host> Screen<H> for JumpScreen {
         while let Some(ev) = ctx.actors.pop_event() {
             self.on_actor_event(ctx, ev.kind, ev.actor_id).await;
         }
-        ctx.actors.collect_pickups(&ctx.av, ACTOR_PLAYER);
+        for j in &self.jumpers {
+            ctx.actors.collect_pickups(&ctx.av, j.actor);
+        }
         if self.countdown < COUNTDOWN_ACTIVE {
             self.update_race(ctx);
         } else if !self.intro_pending {
@@ -835,7 +971,7 @@ impl<H: Host> Screen<H> for JumpScreen {
         ctx.actors.draw(&mut ctx.av, &ctx.scene, 8);
         ctx.cursor.draw(&mut ctx.av);
         ctx.scene.advance_anims(&ctx.av);
-        let (_px, py) = ctx.actors.pos(ACTOR_PLAYER);
+        let py = self.camera_target(ctx);
         let (sx, sy) = (ctx.scene.scroll_x, ctx.scene.scroll_y);
         let rel = (py as f64 - sy as f64) as f32;
         let sy = camera_scroll_y(rel, sy, self.max_scroll_y);
@@ -843,11 +979,11 @@ impl<H: Host> Screen<H> for JumpScreen {
             ret = STATE_HOME_WORLD;
         }
         ctx.scene.set_scroll(sx, sy);
-        if self.challenge != 0 && self.player_state == PLAYER_FINISHED {
+        if self.challenge != 0 && self.finished() {
             self.end_delay += 1;
             if CHALLENGE_EXIT_FRAMES < self.end_delay {
                 ctx.player.challenge_won = (self.result == RESULT_PLAYER_FIRST) as u8;
-                ret = STATE_CHALLENGE;
+                ret = if self.versus() { STATE_HOME_WORLD } else { STATE_CHALLENGE };
             }
         }
         ret
@@ -903,5 +1039,22 @@ mod tests {
         assert_eq!(camera_scroll_y(290.5, 50, 400), 60);
         assert_eq!(camera_scroll_y(50.5, 100, 400), 41);
         assert_eq!(camera_scroll_y(10.0, 50, 400), 0);
+    }
+
+    #[test]
+    fn jumper_numbers_follow_the_record() {
+        assert_eq!(Jumper::run_speed(0), 6.0);
+        assert_eq!(Jumper::run_speed(1), 8.0);
+        assert_eq!(Jumper::run_speed(2), 10.0);
+        assert_eq!(Jumper::launch(0), -15.0);
+        assert_eq!(Jumper::launch(10), -20.0);
+    }
+
+    #[test]
+    fn a_screen_of_height_decides_a_friend_climb() {
+        assert_eq!(left_behind(1000.0, 1000.0), None);
+        assert_eq!(left_behind(600.0, 1000.0), Some(0));
+        assert_eq!(left_behind(1000.0, 600.0), Some(1));
+        assert_eq!(left_behind(700.0, 1000.0), None);
     }
 }

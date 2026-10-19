@@ -6,6 +6,8 @@ use crate::ctx::{
     Ctx, KEY_ESC, KEY_SPACE, RESULT_CONTINUE, STATE_HOME_WORLD, STATE_JUMPING, STATE_RUNNING, STATE_THROWING, Screen,
 };
 use crate::host::Host;
+use crate::player::PlayerData;
+use crate::skin::Skin;
 use crate::video::play_video_modal;
 
 const ANIM_STANCE: usize = 0;
@@ -28,7 +30,11 @@ const TALK_ANIM_DELAY: i16 = 0xf;
 
 const THIEF_GROWL: &str = "theif growley3.wav";
 
-// Challenge dialogue, state 0xd, where the Cap'n and the thief pick the next mini game
+// Where each form of a crunchling stands on the left as the challenged and on the right as the challenger
+const CHALLENGED_SPOT: [(f32, f32); 3] = [(110.0, 320.0), (100.0, 300.0), (80.0, 270.0)];
+const CHALLENGER_SPOT: [(f32, f32); 3] = [(410.0, 320.0), (398.0, 300.0), (390.0, 270.0)];
+
+// Challenge dialogue, state 0xd, where the Cap'n names the next mini game against the thief or a friend
 #[derive(Clone, Debug, Default)]
 pub struct ChallengeScreen {
     anims: [u16; 6],
@@ -38,6 +44,12 @@ pub struct ChallengeScreen {
     dialogue_state: i32,
     picked_game: i32,
     after_loss: bool,
+    versus: bool,
+}
+
+// Standing spot of a crunchling by stage, clamped to the adult row for anything beyond
+fn spot(table: &[(f32, f32); 3], stage: u16) -> (f32, f32) {
+    table[(stage as usize).min(2)]
 }
 
 // State id of the picked mini game, none for the degenerate top value of the random pick
@@ -110,13 +122,8 @@ impl ChallengeScreen {
         if actor == ACTOR_CRUNCHLING {
             let stance = self.anims[ANIM_STANCE];
             ctx.actors.set_anims(&ctx.av, ACTOR_CRUNCHLING, stance, stance, false, STATE_RESTART_FORWARD);
-            if ctx.player.stage == 0 {
-                ctx.actors.set_pos(ACTOR_CRUNCHLING, 110.0, 320.0);
-            } else if ctx.player.stage == 1 {
-                ctx.actors.set_pos(ACTOR_CRUNCHLING, 100.0, 300.0);
-            } else if ctx.player.stage == 2 {
-                ctx.actors.set_pos(ACTOR_CRUNCHLING, 80.0, 270.0);
-            }
+            let (x, y) = spot(&CHALLENGED_SPOT, ctx.player.stage);
+            ctx.actors.set_pos(ACTOR_CRUNCHLING, x, y);
             ctx.actors.face(&ctx.av, ACTOR_CRUNCHLING, FACING_NONE);
         } else if actor == ACTOR_CAPN {
             let idle = self.anims[ANIM_CAPN_IDLE];
@@ -129,7 +136,13 @@ impl ChallengeScreen {
         } else if actor == ACTOR_THIEF {
             let stance = self.anims[ANIM_THIEF_STANCE];
             ctx.actors.set_anims(&ctx.av, ACTOR_THIEF, stance, stance, false, STATE_RESTART_FORWARD);
-            ctx.actors.set_pos(ACTOR_THIEF, 361.0, 180.0);
+            if self.versus {
+                let stage = ctx.session.guest().map_or(0, PlayerData::shown_stage);
+                let (x, y) = spot(&CHALLENGER_SPOT, stage);
+                ctx.actors.set_pos(ACTOR_THIEF, x, y);
+            } else {
+                ctx.actors.set_pos(ACTOR_THIEF, 361.0, 180.0);
+            }
             ctx.actors.face(&ctx.av, ACTOR_THIEF, FACING_NONE);
             if self.after_loss {
                 ctx.actors.set_timer(ACTOR_THIEF, SPEAKER_DELAY);
@@ -142,8 +155,9 @@ impl ChallengeScreen {
 }
 
 impl<H: Host> Screen<H> for ChallengeScreen {
-    // Loads the dialogue scene and cast, starts the music and picks the mini game
+    // Loads the dialogue scene and cast, the friend's crunchling as the challenger when one is visiting
     async fn init(&mut self, ctx: &mut Ctx<H>) -> bool {
+        self.versus = ctx.session.guest().is_some();
         ctx.scene.load(&mut ctx.av, &mut ctx.host, "challenge").await;
         let Some(mouse) = ctx.av.get_anim(&mut ctx.host, "mouse").await else { return false };
         self.cursor_anim = mouse;
@@ -161,16 +175,24 @@ impl<H: Host> Screen<H> for ChallengeScreen {
         ctx.av.get_anim_palette(stance, &mut pal);
         ctx.player.recolor_palette(&mut pal);
         ctx.av.set_anim_palette(stance, &pal);
-        let shared = [
-            (ANIM_CAPN_IDLE, "capn_cap008"),
-            (ANIM_CAPN_TALK_A, "capn_cap013"),
-            (ANIM_CAPN_TALK_B, "capn_cap013"),
-            (ANIM_THIEF_STANCE, "thief_challenge_stance"),
-            (ANIM_THIEF_TALK, "thief_challenge_talk"),
-        ];
+        let shared = [(ANIM_CAPN_IDLE, "capn_cap008"), (ANIM_CAPN_TALK_A, "capn_cap013"), (ANIM_CAPN_TALK_B, "capn_cap013")];
         for (slot, name) in shared {
             let Some(h) = ctx.av.get_anim(&mut ctx.host, name).await else { return false };
             self.anims[slot] = h;
+        }
+        if let Some(guest) = ctx.session.guest().cloned() {
+            let skin = Skin::guest(&guest);
+            let Some((stance, _)) = skin.palette(&mut ctx.av, &mut ctx.host, "stance", false, false).await else {
+                return false;
+            };
+            self.anims[ANIM_THIEF_STANCE] = stance;
+            self.anims[ANIM_THIEF_TALK] = stance;
+        } else {
+            let thief = [(ANIM_THIEF_STANCE, "thief_challenge_stance"), (ANIM_THIEF_TALK, "thief_challenge_talk")];
+            for (slot, name) in thief {
+                let Some(h) = ctx.av.get_anim(&mut ctx.host, name).await else { return false };
+                self.anims[slot] = h;
+            }
         }
         self.music = ctx.av.play_stream_sound(&mut ctx.host, "ps57challenge.wav", true, 0).await;
         self.voice = 0;
@@ -204,10 +226,15 @@ impl<H: Host> Screen<H> for ChallengeScreen {
             if ctx.stream_done(self.voice) {
                 let idle = self.anims[ANIM_CAPN_IDLE];
                 ctx.actors.set_anims(&ctx.av, ACTOR_CAPN, idle, idle, false, STATE_RESTART_FORWARD);
-                let talk = self.anims[ANIM_THIEF_TALK];
-                ctx.actors.set_anims(&ctx.av, ACTOR_THIEF, talk, talk, false, STATE_RESTART_FORWARD);
-                self.voice = ctx.av.play_stream_sound(&mut ctx.host, THIEF_GROWL, false, self.voice).await;
-                self.dialogue_state = 2;
+                if self.versus {
+                    ctx.actors.set_timer(ACTOR_CAPN, SPEAKER_DELAY);
+                    self.dialogue_state = 3;
+                } else {
+                    let talk = self.anims[ANIM_THIEF_TALK];
+                    ctx.actors.set_anims(&ctx.av, ACTOR_THIEF, talk, talk, false, STATE_RESTART_FORWARD);
+                    self.voice = ctx.av.play_stream_sound(&mut ctx.host, THIEF_GROWL, false, self.voice).await;
+                    self.dialogue_state = 2;
+                }
             }
         } else if self.dialogue_state == 2 {
             if ctx.stream_done(self.voice) {
@@ -267,6 +294,13 @@ impl<H: Host> Screen<H> for ChallengeScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spots_follow_the_stage_and_clamp() {
+        assert_eq!(spot(&CHALLENGED_SPOT, 0), (110.0, 320.0));
+        assert_eq!(spot(&CHALLENGER_SPOT, 1), (398.0, 300.0));
+        assert_eq!(spot(&CHALLENGER_SPOT, 9), (390.0, 270.0));
+    }
 
     #[test]
     fn picked_game_maps_to_states() {

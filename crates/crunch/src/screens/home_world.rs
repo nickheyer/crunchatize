@@ -17,6 +17,7 @@ use crate::host::Host;
 use crate::online::Who;
 use crate::player::PlayerData;
 use crate::scene::{HOVER_HIDDEN, HOVER_NORMAL, HOVER_PRESSED};
+use crate::skin::Skin;
 
 const ACTOR_CRUNCHLING: i32 = 0;
 const ACTOR_CAPN: i32 = 1;
@@ -25,6 +26,7 @@ const ACTOR_PILE: i32 = 3;
 const ACTOR_BOX: i32 = 4;
 const ACTOR_DOOR: i32 = 5;
 const ACTOR_CASTER: i32 = 6;
+const ACTOR_GUEST: i32 = 7;
 
 const OBJ_K1: i32 = 1;
 const OBJ_K2: i32 = 2;
@@ -63,6 +65,33 @@ const SEQ_SPEED: u32 = 3;
 const SEQ_JUMP: u32 = 4;
 const SEQ_STRENGTH: u32 = 5;
 const SEQ_CHALLENGE: u32 = 6;
+
+// States of the visiting friend's crunchling, which wanders, plays and leaves for a challenge
+const GS_IDLE: u32 = 0;
+const GS_WALK_RIGHT: u32 = 1;
+const GS_WALK_LEFT: u32 = 2;
+const GS_PLAYING: u32 = 3;
+const GS_QTIP_OUT: u32 = 4;
+const GS_QTIP_EAR_LOOP: u32 = 5;
+const GS_QTIP_DISGUST: u32 = 6;
+const GS_QTIP_THROW: u32 = 7;
+const GS_LEAVING: u32 = 8;
+
+// Handle table of the visiting crunchling's own recoloured animations
+const G_BLINK: usize = 0;
+const G_WALK_LEFT: usize = 1;
+const G_TURN_LEFT: usize = 2;
+const G_WALK_RIGHT: usize = 3;
+const G_TURN_RIGHT: usize = 4;
+const G_RUN_LEFT: usize = 5;
+const G_RUN_RIGHT: usize = 6;
+const G_DANCE: usize = 7;
+const G_TICKLE: usize = 8;
+const G_QTIP_OUT: usize = 9;
+const G_QTIP_EAR_LOOP: usize = 10;
+const G_QTIP_DISGUST: usize = 11;
+const G_QTIP_THROW: usize = 12;
+const G_COUNT: usize = 13;
 
 // Indices into the anim handle table that lived at DAT_0042bd60 in the original
 const ANIM_BLINK: u16 = 0x00;
@@ -122,6 +151,12 @@ const CASTER_STEP: f32 = 3.0;
 const CASTER_HIDDEN_Y: f32 = -220.0;
 const PILE_APPROACH: f32 = 65.0;
 const GROUND_Y: f32 = 168.0;
+const GUEST_DY: f32 = 10.0;
+const GUEST_START_X: f32 = 200.0;
+const GUEST_WALK_LEFT_X: i32 = 160;
+const GUEST_WALK_RIGHT_X: i32 = 440;
+const EXIT_X: i32 = -0x7d;
+const GUEST_EXIT_DELAY: i32 = 0x1e;
 
 const COL_OFF_X: usize = 0;
 const COL_OFF_Y: usize = 1;
@@ -153,6 +188,24 @@ fn bar_overlay_left(level: i16) -> u16 {
     raw.min(0x80)
 }
 
+// Tool a hand turns into over a crunchling from its height, the hand alone over a sleeper
+fn pick_tool(player: &PlayerData, my: i32, sleeping: bool) -> u16 {
+    if sleeping {
+        return ANIM_MOUSE_HAND;
+    }
+    let stage = player.shown_stage();
+    let row = &POS_TABLE[pos_table_row(player)];
+    if stage == 0 && row[COL_FEATHER_MIN] < my {
+        ANIM_MOUSE_FEATHER
+    } else if row[COL_HAND_MIN] < my && my <= row[COL_HAND_MAX] {
+        ANIM_MOUSE_HAND
+    } else if stage == 1 && row[COL_HAND_MAX] < my && my < row[COL_HAND_MAX] + 0x14 {
+        ANIM_MOUSE_QTIP
+    } else {
+        ANIM_MOUSE
+    }
+}
+
 // Clip width of a stat minibar, three pixels per point capped at 60, absent for an empty stat
 fn minibar_width(stat: i32) -> Option<u16> {
     let raw = ((stat as i16 as i32) * 3) as u16;
@@ -162,7 +215,7 @@ fn minibar_width(stat: i32) -> Option<u16> {
     Some(raw.min(0x3c))
 }
 
-// The crunchling's home with feeding, tools, training doors and the Cap'n sequences
+// The crunchling's home with feeding, tools, training doors, the Cap'n sequences and a visiting friend's crunchling
 pub struct HomeWorldScreen {
     mouse_latched: bool,
     helper_latched: bool,
@@ -204,7 +257,14 @@ pub struct HomeWorldScreen {
     sfx_transform: u16,
     sfx_run_fast: u16,
     sfx_yahoo: u16,
+    sfx_guest_praise: u16,
+    sfx_guest_giggle: u16,
+    sfx_guest_qtip: u16,
     anims: [u16; ANIM_COUNT],
+    guest_anims: [u16; G_COUNT],
+    guest_state: u32,
+    guest_last_walk: u32,
+    guest_ear_loops: i32,
 }
 
 impl Default for HomeWorldScreen {
@@ -256,7 +316,14 @@ impl HomeWorldScreen {
             sfx_transform: 0,
             sfx_run_fast: 0,
             sfx_yahoo: 0,
+            sfx_guest_praise: 0,
+            sfx_guest_giggle: 0,
+            sfx_guest_qtip: 0,
             anims: [0; ANIM_COUNT],
+            guest_anims: [0; G_COUNT],
+            guest_state: GS_IDLE,
+            guest_last_walk: GS_WALK_RIGHT,
+            guest_ear_loops: 0,
         }
     }
 
@@ -473,6 +540,190 @@ impl HomeWorldScreen {
             }
         }
         true
+    }
+
+    // Loads the visiting crunchling's animations and voice under their own keys and colours
+    async fn load_guest_set<H: Host>(&mut self, ctx: &mut Ctx<H>, guest: &PlayerData) -> bool {
+        let skin = Skin::guest(guest);
+        let Some((blink, palette)) = skin.palette(&mut ctx.av, &mut ctx.host, "blink", false, false).await else {
+            return false;
+        };
+        self.guest_anims[G_BLINK] = blink;
+        let mut set = vec![
+            (G_WALK_LEFT, "hm_walk_left"),
+            (G_TURN_LEFT, "hm_turn_left"),
+            (G_WALK_RIGHT, "hm_walk_right"),
+            (G_TURN_RIGHT, "hm_turn_right"),
+            (G_RUN_RIGHT, "hm_run_right"),
+            (G_RUN_LEFT, "hm_run_left"),
+            (G_DANCE, "dance"),
+        ];
+        let praise = match guest.shown_stage() {
+            0 => {
+                set.push((G_TICKLE, "tickle"));
+                let Some(h) = Self::load_sfx(ctx, "CS_b_giggle.wav").await else { return false };
+                self.sfx_guest_giggle = h;
+                "CS_b_praise.wav"
+            }
+            1 => {
+                set.extend([
+                    (G_QTIP_OUT, "qtip_out"),
+                    (G_QTIP_EAR_LOOP, "qtip_ear_loop"),
+                    (G_QTIP_DISGUST, "qtip_disgust"),
+                    (G_QTIP_THROW, "qtip_throw"),
+                ]);
+                let Some(h) = Self::load_sfx(ctx, "cs_qtip.wav").await else { return false };
+                self.sfx_guest_qtip = h;
+                "CS_t_praise.wav"
+            }
+            _ => "CS_a_praise.wav",
+        };
+        let Some(h) = Self::load_sfx(ctx, praise).await else { return false };
+        self.sfx_guest_praise = h;
+        for (index, suffix) in set {
+            let Some(h) = skin.anim(&mut ctx.av, &mut ctx.host, suffix, false, false, &palette).await else {
+                return false;
+            };
+            self.guest_anims[index] = h;
+        }
+        true
+    }
+
+    fn set_guest_anim<H: Host>(&self, ctx: &mut Ctx<H>, index: usize, notify: bool, mode: i16) {
+        let h = self.guest_anims[index];
+        ctx.actors.set_anims(&ctx.av, ACTOR_GUEST, h, h, notify, mode);
+    }
+
+    // Blinks in place for ninety ticks before the next wander
+    fn guest_idle<H: Host>(&mut self, ctx: &mut Ctx<H>) {
+        self.guest_state = GS_IDLE;
+        ctx.actors.walk_to(&ctx.av, ACTOR_GUEST, NO_TARGET);
+        ctx.actors.set_timer(ACTOR_GUEST, 0x5a);
+        self.set_guest_anim(ctx, G_BLINK, false, STATE_RESTART_FORWARD);
+        ctx.actors.face(&ctx.av, ACTOR_GUEST, FACING_NONE);
+    }
+
+    // Parks the visiting crunchling briefly, then it runs out of the door after the resident one
+    fn guest_leave<H: Host>(&mut self, ctx: &mut Ctx<H>) {
+        self.guest_state = GS_LEAVING;
+        self.set_guest_anim(ctx, G_BLINK, false, STATE_RESTART_FORWARD);
+        ctx.actors.walk_to(&ctx.av, ACTOR_GUEST, NO_TARGET);
+        ctx.actors.face(&ctx.av, ACTOR_GUEST, FACING_NONE);
+        ctx.actors.set_timer(ACTOR_GUEST, GUEST_EXIT_DELAY);
+    }
+
+    // Starts a wander, runs out of the door, or returns to blinking when the guest's timer fires
+    fn on_guest_timer<H: Host>(&mut self, ctx: &mut Ctx<H>) {
+        match self.guest_state {
+            GS_IDLE => {
+                let right = self.guest_anims[G_WALK_RIGHT];
+                let left = self.guest_anims[G_WALK_LEFT];
+                ctx.actors.set_anims(&ctx.av, ACTOR_GUEST, right, left, false, STATE_RESTART_FORWARD);
+                ctx.actors.set_arc(ACTOR_GUEST, 4.0, 8.0);
+                ctx.actors.set_timer(ACTOR_GUEST, 0x32);
+                self.guest_state = self.guest_last_walk;
+                let target = if self.guest_state == GS_WALK_RIGHT { GUEST_WALK_RIGHT_X } else { GUEST_WALK_LEFT_X };
+                ctx.actors.walk_to(&ctx.av, ACTOR_GUEST, target);
+            }
+            GS_WALK_RIGHT | GS_WALK_LEFT => {
+                self.guest_last_walk = self.guest_state;
+                self.guest_idle(ctx);
+            }
+            GS_LEAVING => {
+                let right = self.guest_anims[G_RUN_RIGHT];
+                let left = self.guest_anims[G_RUN_LEFT];
+                ctx.actors.set_anims(&ctx.av, ACTOR_GUEST, right, left, false, STATE_RESTART_FORWARD);
+                ctx.actors.set_arc(ACTOR_GUEST, 12.0, 8.0);
+                ctx.actors.walk_to(&ctx.av, ACTOR_GUEST, EXIT_X);
+            }
+            _ => {}
+        }
+    }
+
+    // Turns a wander around at its end and leaves a departing guest on its way
+    fn on_guest_target_reached<H: Host>(&mut self, ctx: &mut Ctx<H>) {
+        match self.guest_state {
+            GS_WALK_RIGHT => {
+                ctx.actors.walk_to(&ctx.av, ACTOR_GUEST, GUEST_WALK_LEFT_X);
+                self.guest_state = GS_WALK_LEFT;
+            }
+            GS_WALK_LEFT => {
+                ctx.actors.walk_to(&ctx.av, ACTOR_GUEST, GUEST_WALK_RIGHT_X);
+                self.guest_state = GS_WALK_RIGHT;
+            }
+            GS_LEAVING => {}
+            _ => self.guest_idle(ctx),
+        }
+    }
+
+    // Chains the guest's qtip anims and returns to blinking after any other play
+    fn on_guest_anim_end<H: Host>(&mut self, ctx: &mut Ctx<H>) {
+        match self.guest_state {
+            GS_QTIP_OUT => {
+                self.set_guest_anim(ctx, G_QTIP_EAR_LOOP, true, STATE_RESTART_FORWARD);
+                self.guest_state = GS_QTIP_EAR_LOOP;
+                self.guest_ear_loops = 0;
+            }
+            GS_QTIP_EAR_LOOP => {
+                let loops = self.guest_ear_loops;
+                self.guest_ear_loops += 1;
+                if loops != 0 {
+                    self.set_guest_anim(ctx, G_QTIP_DISGUST, true, STATE_RESTART_FORWARD);
+                    self.guest_state = GS_QTIP_DISGUST;
+                }
+            }
+            GS_QTIP_DISGUST => {
+                self.set_guest_anim(ctx, G_QTIP_THROW, true, STATE_RESTART_FORWARD);
+                self.guest_state = GS_QTIP_THROW;
+            }
+            _ => self.guest_idle(ctx),
+        }
+    }
+
+    // Picks a hand's tool over the visiting crunchling and tickles, praises or cleans it on a click
+    fn on_guest_hit<H: Host>(&mut self, ctx: &mut Ctx<H>, my: i32, down: bool, who: Who) {
+        let current = match who {
+            Who::Primary => self.cursor_index,
+            Who::Helper => self.helper_cursor_index,
+        };
+        let Some(guest) = ctx.session.guest() else { return };
+        if current != ANIM_MOUSE {
+            return;
+        }
+        let tool = pick_tool(guest, my - GUEST_DY as i32, false);
+        let busy = matches!(self.guest_state, GS_PLAYING | GS_QTIP_OUT | GS_QTIP_EAR_LOOP | GS_QTIP_DISGUST | GS_LEAVING);
+        if down && !busy {
+            ctx.actors.walk_to(&ctx.av, ACTOR_GUEST, NO_TARGET);
+            ctx.actors.set_timer(ACTOR_GUEST, 0);
+            if tool == ANIM_MOUSE_FEATHER {
+                ctx.av.play_sfx(self.sfx_guest_giggle, -1);
+                self.set_guest_anim(ctx, G_TICKLE, true, STATE_RESTART_FORWARD);
+                ctx.actors.face(&ctx.av, ACTOR_GUEST, FACING_FORCE_NONE);
+                self.guest_state = GS_PLAYING;
+            } else if tool == ANIM_MOUSE_HAND {
+                ctx.av.play_sfx(self.sfx_guest_praise, -1);
+                self.set_guest_anim(ctx, G_DANCE, true, STATE_RESTART_FORWARD);
+                ctx.actors.face(&ctx.av, ACTOR_GUEST, FACING_FORCE_NONE);
+                self.guest_state = GS_PLAYING;
+            } else if tool == ANIM_MOUSE_QTIP {
+                self.set_guest_anim(ctx, G_QTIP_OUT, true, STATE_RESTART_FORWARD);
+                ctx.actors.face(&ctx.av, ACTOR_GUEST, FACING_FORCE_NONE);
+                self.guest_state = GS_QTIP_OUT;
+                ctx.av.play_sfx(self.sfx_guest_qtip, -1);
+            } else {
+                self.guest_idle(ctx);
+            }
+            if tool != ANIM_MOUSE
+                && let Some(guest) = ctx.session.guest_mut()
+                && guest.happiness < 5
+            {
+                guest.happiness += 1;
+            }
+        }
+        match who {
+            Who::Primary => self.cursor_index = tool,
+            Who::Helper => self.helper_cursor_index = tool,
+        }
     }
 
     fn set_crunchling_anim<H: Host>(&self, ctx: &mut Ctx<H>, index: u16, notify: bool, mode: i16) {
@@ -723,7 +974,9 @@ impl HomeWorldScreen {
             OBJ_SPEED => self.capn_sequence = SEQ_SPEED,
             OBJ_STRENGTH => self.capn_sequence = SEQ_STRENGTH,
             OBJ_JUMP => self.capn_sequence = SEQ_JUMP,
-            OBJ_CHALLENGE if ctx.player.stage > 1 => self.capn_sequence = SEQ_CHALLENGE,
+            OBJ_CHALLENGE if ctx.player.stage > 1 || ctx.session.guest().is_some() => {
+                self.capn_sequence = SEQ_CHALLENGE;
+            }
             OBJ_TIPS => {
                 if ctx.player.tips_index == 0 {
                     self.caster_speak(ctx, "014.wav");
@@ -806,7 +1059,7 @@ impl HomeWorldScreen {
         }
     }
 
-    // Opens the door and parks the crunchling for twenty ticks before it runs off to the next state
+    // Opens the door, parks the crunchling for twenty ticks before it runs off, and sends the guest after it to a challenge
     fn leave_to_game<H: Host>(&mut self, ctx: &mut Ctx<H>, next_state: u32) {
         self.pending_state = next_state;
         self.set_door(ctx, true);
@@ -817,6 +1070,9 @@ impl HomeWorldScreen {
         ctx.actors.set_timer(ACTOR_CRUNCHLING, 0x14);
         ctx.actors.set_y(ACTOR_CRUNCHLING, GROUND_Y);
         ctx.cursor.set_visible(false);
+        if next_state == STATE_CHALLENGE && ctx.session.guest().is_some() {
+            self.guest_leave(ctx);
+        }
     }
 
     // Queues a caster speech, hides the cursor and sends the crunchling running to x 300
@@ -840,6 +1096,8 @@ impl HomeWorldScreen {
             EVENT_TARGET_REACHED => {
                 if actor == ACTOR_CAPN {
                     self.capn_sequence_step(ctx).await;
+                } else if actor == ACTOR_GUEST {
+                    self.on_guest_target_reached(ctx);
                 } else {
                     match self.crunchling_state {
                         CL_IDLE => self.idle(ctx),
@@ -881,7 +1139,11 @@ impl HomeWorldScreen {
             EVENT_MOUSE_HIT => {
                 let my = i32::from(ctx.cursor.y);
                 let down = ctx.av.is_mouse_button_down(MOUSE_LEFT);
-                self.on_mouse_hit_at(ctx, my, down, Who::Primary);
+                if actor == ACTOR_GUEST {
+                    self.on_guest_hit(ctx, my, down, Who::Primary);
+                } else {
+                    self.on_mouse_hit_at(ctx, my, down, Who::Primary);
+                }
             }
             EVENT_TIMER => self.on_timer(ctx, actor).await,
             _ => {}
@@ -897,22 +1159,7 @@ impl HomeWorldScreen {
         if tool != ANIM_MOUSE {
             return;
         }
-        if self.crunchling_state == CL_SLEEP {
-            tool = ANIM_MOUSE_HAND;
-        } else {
-            let mut stage = ctx.player.stage as u32;
-            if stage != 0 && ctx.player.transform_pending != 0 {
-                stage -= 1;
-            }
-            let row = &POS_TABLE[pos_table_row(&ctx.player)];
-            if stage == 0 && row[COL_FEATHER_MIN] < my {
-                tool = ANIM_MOUSE_FEATHER;
-            } else if row[COL_HAND_MIN] < my && my <= row[COL_HAND_MAX] {
-                tool = ANIM_MOUSE_HAND;
-            } else if stage == 1 && row[COL_HAND_MAX] < my && my < row[COL_HAND_MAX] + 0x14 {
-                tool = ANIM_MOUSE_QTIP;
-            }
-        }
+        tool = pick_tool(&ctx.player, my, self.crunchling_state == CL_SLEEP);
         if down
             && self.crunchling_state != CL_PLAYING
             && self.crunchling_state != CL_QTIP_OUT
@@ -979,15 +1226,24 @@ impl HomeWorldScreen {
                 self.helper_latched = false;
             }
         }
-        let crunchling = ctx.actors.get(ACTOR_CRUNCHLING);
         let (hx, hy) = (i32::from(hx), i32::from(hy));
-        if crunchling.visible && crunchling.mouse_hittable && crunchling.anim.anim != NO_HANDLE {
-            let b = ctx.actors.bbox(&ctx.av, ACTOR_CRUNCHLING);
-            if b[0] <= hx && hx <= b[2] && b[1] <= hy && hy <= b[3] {
-                self.on_mouse_hit_at(ctx, hy, down, Who::Helper);
-            }
+        if Self::hand_over(ctx, ACTOR_CRUNCHLING, hx, hy) {
+            self.on_mouse_hit_at(ctx, hy, down, Who::Helper);
+        }
+        if ctx.actors.find(ACTOR_GUEST).is_some() && Self::hand_over(ctx, ACTOR_GUEST, hx, hy) {
+            self.on_guest_hit(ctx, hy, down, Who::Helper);
         }
         result
+    }
+
+    // True when a point lies inside a visible, touchable actor's hit box
+    fn hand_over<H: Host>(ctx: &Ctx<H>, actor: i32, hx: i32, hy: i32) -> bool {
+        let a = ctx.actors.get(actor);
+        if !a.visible || !a.mouse_hittable || a.anim.anim == NO_HANDLE {
+            return false;
+        }
+        let b = ctx.actors.bbox(&ctx.av, actor);
+        b[0] <= hx && hx <= b[2] && b[1] <= hy && hy <= b[3]
     }
 
     // Gives each of the seven actors its first animation, position, layer and visibility
@@ -1018,6 +1274,15 @@ impl HomeWorldScreen {
                 ctx.actors.set_turn_anims(ACTOR_CRUNCHLING, self.anim(ANIM_TURN_RIGHT), self.anim(ANIM_TURN_LEFT));
                 ctx.actors.face(&ctx.av, ACTOR_CRUNCHLING, FACING_NONE);
                 ctx.actors.set_mouse_hittable(ACTOR_CRUNCHLING, true);
+            }
+            ACTOR_GUEST => {
+                ctx.actors.set_pos(ACTOR_GUEST, GUEST_START_X, GROUND_Y + GUEST_DY);
+                ctx.actors.set_shadow(ACTOR_GUEST, self.anim(ANIM_SHADOW), 0x10, 0x82);
+                ctx.actors.set_shadow_enabled(ACTOR_GUEST, true);
+                ctx.actors.set_turn_anims(ACTOR_GUEST, self.guest_anims[G_TURN_RIGHT], self.guest_anims[G_TURN_LEFT]);
+                ctx.actors.set_mouse_hittable(ACTOR_GUEST, true);
+                self.guest_last_walk = GS_WALK_LEFT;
+                self.guest_idle(ctx);
             }
             ACTOR_CAPN => {
                 if self.capn_sequence == SEQ_NONE {
@@ -1091,6 +1356,7 @@ impl HomeWorldScreen {
                 }
                 _ => self.idle(ctx),
             },
+            ACTOR_GUEST => self.on_guest_anim_end(ctx),
             ACTOR_CAPN => self.capn_sequence_step(ctx).await,
             ACTOR_TUBE => ctx.actors.set_visible(ACTOR_TUBE, false),
             ACTOR_PILE => {
@@ -1179,6 +1445,8 @@ impl HomeWorldScreen {
                     self.idle(ctx);
                 }
             }
+        } else if actor == ACTOR_GUEST {
+            self.on_guest_timer(ctx);
         } else if actor == ACTOR_CAPN {
             self.capn_sequence_step(ctx).await;
         } else if actor == ACTOR_TUBE {
@@ -1346,7 +1614,8 @@ impl<H: Host> Screen<H> for HomeWorldScreen {
         ctx.scene.set_hover_by_id(OBJ_FOOD_GLOW, HOVER_HIDDEN);
         ctx.scene.set_hover_by_id(OBJ_FEEDER_GLOW, HOVER_HIDDEN);
         ctx.scene.set_hover_by_id(OBJ_CASTER_GLOW, HOVER_HIDDEN);
-        if ctx.player.stage < 2 {
+        let guest = ctx.session.guest().cloned();
+        if ctx.player.stage < 2 && guest.is_none() {
             ctx.scene.set_hover_by_id(OBJ_CHALLENGE, HOVER_PRESSED);
         }
         let name = ctx.player.name_str();
@@ -1363,6 +1632,9 @@ impl<H: Host> Screen<H> for HomeWorldScreen {
         ctx.actors.add_actor(ACTOR_CAPN, true);
         ctx.actors.add_actor(ACTOR_PILE, true);
         ctx.actors.add_actor(ACTOR_BOX, true);
+        if guest.is_some() {
+            ctx.actors.add_actor(ACTOR_GUEST, true);
+        }
         let blink_name = ctx.player.anim_name("blink", false, false);
         let Some(blink) = ctx.av.get_anim_retain_image(&mut ctx.host, &blink_name).await else { return false };
         self.anims[ANIM_BLINK as usize] = blink;
@@ -1388,6 +1660,13 @@ impl<H: Host> Screen<H> for HomeWorldScreen {
         }
         if !self.load_anim_set(ctx, &palette).await {
             return false;
+        }
+        if let Some(guest) = &guest {
+            let row = &POS_TABLE[guest.anim_index(false) as usize];
+            ctx.actors.set_draw_offset(ACTOR_GUEST, row[COL_OFF_X], row[COL_OFF_Y]);
+            if !self.load_guest_set(ctx, guest).await {
+                return false;
+            }
         }
         ctx.cursor.set_anim(&ctx.av, self.anim(ANIM_MOUSE));
         ctx.cursor.set_visible(true);
@@ -1534,6 +1813,19 @@ mod tests {
         assert_eq!(pos_table_row(&p), 4);
         p.stage = 0;
         assert_eq!(pos_table_row(&p), 1);
+    }
+
+    #[test]
+    fn tools_follow_the_hand_height_over_each_form() {
+        let baby = PlayerData::default();
+        assert_eq!(pick_tool(&baby, 250, false), ANIM_MOUSE_HAND);
+        assert_eq!(pick_tool(&baby, 310, false), ANIM_MOUSE_FEATHER);
+        assert_eq!(pick_tool(&baby, 100, false), ANIM_MOUSE);
+        assert_eq!(pick_tool(&baby, 100, true), ANIM_MOUSE_HAND);
+        let teen = PlayerData { stage: 1, ..Default::default() };
+        assert_eq!(pick_tool(&teen, 230, false), ANIM_MOUSE_HAND);
+        assert_eq!(pick_tool(&teen, 250, false), ANIM_MOUSE_QTIP);
+        assert_eq!(pick_tool(&teen, 310, false), ANIM_MOUSE);
     }
 
     #[test]

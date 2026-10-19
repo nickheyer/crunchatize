@@ -159,6 +159,11 @@ impl PlayerData {
         out
     }
 
+    // Stage the crunchling still looks like, one back while a transform waits for its home world
+    pub fn shown_stage(&self) -> u16 {
+        if self.transform_pending != 0 && self.stage != 0 { self.stage - 1 } else { self.stage }
+    }
+
     // Row index into the per form tables, type plus three per stage
     pub fn anim_index(&self, ignore_transform: bool) -> u32 {
         let kind = self.kind as i32 as u32;
@@ -332,6 +337,16 @@ mod tests {
         p.kind = 2;
         assert_eq!(p.anim_name("stance", false, true), "a_stance");
         assert_eq!(p.anim_index(false), 8);
+    }
+
+    #[test]
+    fn shown_stage_lags_a_pending_transform() {
+        let mut p = PlayerData { stage: 2, ..Default::default() };
+        assert_eq!(p.shown_stage(), 2);
+        p.transform_pending = 1;
+        assert_eq!(p.shown_stage(), 1);
+        p.stage = 0;
+        assert_eq!(p.shown_stage(), 0);
     }
 
     #[test]

@@ -1,16 +1,17 @@
 use avmanager::anim::{STATE_RESTART_BACKWARD, STATE_RESTART_FORWARD, STATE_STOPPED};
-use avmanager::texture::Palette24;
 
 use crate::actors::{
     EVENT_ANIM_END, EVENT_GROUND_REACHED, EVENT_INIT_OBJECT, EVENT_TARGET_REACHED, EVENT_TIMER, FACING_NONE, NO_TARGET,
 };
 use crate::ctx::{
-    Ctx, KEY_ESC, KEY_LEFT, KEY_RIGHT, KEY_SPACE, MOUSE_LEFT, RESULT_CONTINUE, STATE_CHALLENGE, STATE_HOME_WORLD,
-    STATE_THROWING, Screen,
+    Ctx, Held, KEY_ESC, KEY_SPACE, MOUSE_LEFT, RESULT_CONTINUE, STATE_CHALLENGE, STATE_HOME_WORLD, STATE_THROWING,
+    Screen,
 };
 use crate::host::Host;
+use crate::online::wins_text;
 use crate::player::PlayerData;
 use crate::scene::{HOVER_HIDDEN, HOVER_NORMAL};
+use crate::skin::Skin;
 
 const A_STANCE: usize = 0;
 const A_THROW: usize = 1;
@@ -54,7 +55,7 @@ const S_LIGHTNING: usize = 7;
 const S_FADEIN: usize = 8;
 
 const ACTOR_PLAYER: i32 = 0;
-const ACTOR_THIEF: i32 = 1;
+const ACTOR_RIVAL: i32 = 1;
 const ACTOR_ROCK0: i32 = 2;
 const ACTOR_LAVA0: i32 = 6;
 const ACTOR_ERUPT_LEFT: i32 = 10;
@@ -118,6 +119,10 @@ const LAVA_GRAVITY: f32 = f32::from_bits(0x3ecc_cccd);
 const LAYER_MAIN: u32 = 1;
 const LAYER_CAPN: u32 = 4;
 const LAYER_TV: u32 = 8;
+const WINNING_SCORE: u32 = 10;
+const PLAYER_START: (f32, f32) = (300.0, 320.0);
+const GUEST_START: (f32, f32) = (440.0, 312.0);
+const THIEF_START: (f32, f32) = (440.0, 232.0);
 
 // Draw offset and rock spawn offset for one stage and type row of the table at 0x42a5e8
 #[derive(Clone, Copy)]
@@ -149,7 +154,32 @@ struct RockSlot {
     owner: i32,
 }
 
-// The rock throwing mini-game, state 0xb, with its tutorial, countdown and challenge variant
+// A crunchling throwing rocks, the resident one or the visiting friend's, with its anims and rock numbers
+#[derive(Clone, Copy, Default)]
+struct Thrower {
+    actor: i32,
+    stance: u16,
+    throw: u16,
+    step_left: u16,
+    step_right: u16,
+    reload: u16,
+    state: i32,
+    rock_speed: f32,
+    rock_dx: f32,
+    rock_dy: f32,
+}
+
+impl Thrower {
+    // Rock speed and spawn offset for a crunchling record's strength and form
+    fn numbers(&mut self, player: &PlayerData) {
+        let row = STAGE_TABLE[player.anim_index(false) as usize];
+        self.rock_speed = player.strength as f32 + 12.0;
+        self.rock_dx = row.rock_dx as f32;
+        self.rock_dy = row.rock_dy as f32;
+    }
+}
+
+// The rock throwing mini-game, state 0xb, with its tutorial, countdown, thief challenge and friend match
 #[derive(Default)]
 pub struct ThrowScreen {
     anims: [u16; 30],
@@ -158,9 +188,10 @@ pub struct ThrowScreen {
     music: u32,
     voice: u32,
     score: u32,
-    thief_score: u32,
+    rival_score: u32,
     countdown: u32,
-    player_state: i32,
+    player: Thrower,
+    guest: Option<Thrower>,
     thief_state: i32,
     capn_state: i32,
     intro_step: i32,
@@ -190,15 +221,35 @@ fn set_actor_anim<H: Host>(ctx: &mut Ctx<H>, id: i32, anim: u16, notify: bool, m
     ctx.actors.set_anims(&ctx.av, id, anim, anim, notify, mode);
 }
 
+// Who won a friend match at the first score of ten, the resident crunchling only with the higher score
+fn match_outcome(score: u32, rival_score: u32) -> i32 {
+    if score > rival_score { OUTCOME_WIN } else { OUTCOME_LOSE }
+}
+
 impl ThrowScreen {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    // Loads a thrower's five crunchling animations through its own recoloured palette
+    async fn load_thrower<H: Host>(ctx: &mut Ctx<H>, skin: Skin<'_>, actor: i32) -> Option<Thrower> {
+        let (stance, pal) = skin.palette(&mut ctx.av, &mut ctx.host, "throw_stance", false, false).await?;
+        let mut t = Thrower { actor, stance, ..Thrower::default() };
+        t.throw = skin.anim(&mut ctx.av, &mut ctx.host, "throw", false, false, &pal).await?;
+        t.step_left = skin.anim(&mut ctx.av, &mut ctx.host, "sidestep", false, false, &pal).await?;
+        t.step_right = t.step_left;
+        t.reload = skin.anim(&mut ctx.av, &mut ctx.host, "throwReload", false, false, &pal).await?;
+        t.numbers(skin.data);
+        let row = STAGE_TABLE[skin.data.anim_index(false) as usize];
+        ctx.actors.set_draw_offset(actor, row.draw_off_x, row.draw_off_y);
+        Some(t)
     }
 
     // Loads the WAM, sounds, actors and animations, false when any asset is missing
     async fn init_screen<H: Host>(&mut self, ctx: &mut Ctx<H>) -> bool {
         self.challenge_phase = ctx.player.challenge_active as i32;
         self.intro_active = self.challenge_phase == PHASE_NORMAL;
+        let guest = ctx.session.guest().filter(|_| self.challenge_phase != PHASE_NORMAL).cloned();
         if self.challenge_phase == PHASE_NORMAL {
             ctx.scene.load(&mut ctx.av, &mut ctx.host, "throw").await;
             ctx.scene.assign_id("time", OBJ_TIME);
@@ -216,8 +267,11 @@ impl ThrowScreen {
             ctx.scene.assign_id("GoodJob", OBJ_GOOD_JOB);
             ctx.scene.set_hover_by_id(OBJ_GOOD_JOB, HOVER_HIDDEN);
             ctx.scene.set_text_by_id(OBJ_TIME, "0");
-            let thief_label = if ctx.session.helper_present() { ctx.session.helper_name.clone() } else { "Thief".into() };
-            ctx.scene.set_text_by_id(OBJ_TIME_TEXT, &thief_label);
+            let rival_label = match &guest {
+                Some(g) => g.name_str(),
+                None => "Thief".into(),
+            };
+            ctx.scene.set_text_by_id(OBJ_TIME_TEXT, &rival_label);
             let name = ctx.player.name_str();
             ctx.scene.set_text_by_id(OBJ_SCORE_TEXT, &name);
         }
@@ -252,31 +306,24 @@ impl ThrowScreen {
         if self.challenge_phase == PHASE_NORMAL {
             self.music = ctx.av.play_stream_sound(&mut ctx.host, "tg56Throwing.wav", true, 0).await;
         } else {
-            ctx.actors.add_actor(ACTOR_THIEF, true);
+            ctx.actors.add_actor(ACTOR_RIVAL, true);
             self.music = ctx.av.play_stream_sound(&mut ctx.host, "tg57Challenge.wav", true, 0).await;
         }
         for id in [ACTOR_JURICAR, ACTOR_LIGHTNING, ACTOR_PLAYER, 2, 3, 4, 5, ACTOR_COUNTDOWN] {
             ctx.actors.add_actor(id, true);
         }
-        let row = STAGE_TABLE[ctx.player.anim_index(false) as usize];
-        ctx.actors.set_draw_offset(ACTOR_PLAYER, row.draw_off_x, row.draw_off_y);
-        let name = ctx.player.anim_name("throw_stance", false, false);
-        let Some(h) = ctx.av.get_anim_retain_image(&mut ctx.host, &name).await else { return false };
-        self.anims[A_STANCE] = h;
-        let mut pal = Palette24::default();
-        ctx.av.get_anim_palette(self.anims[A_STANCE], &mut pal);
-        ctx.player.recolor_palette(&mut pal);
-        ctx.av.set_anim_palette(self.anims[A_STANCE], &pal);
-        let recolored = [
-            ("throw", A_THROW),
-            ("sidestep", A_SIDESTEP_LEFT),
-            ("sidestep", A_SIDESTEP_RIGHT),
-            ("throwReload", A_THROW_RELOAD),
-        ];
-        for (suffix, slot) in recolored {
-            let name = ctx.player.anim_name(suffix, false, false);
-            let Some(h) = ctx.av.get_anim_use_palette(&mut ctx.host, &name, &pal).await else { return false };
-            self.anims[slot] = h;
+        let resident = ctx.player.clone();
+        let Some(player) = Self::load_thrower(ctx, Skin::host(&resident), ACTOR_PLAYER).await else { return false };
+        self.player = player;
+        self.anims[A_STANCE] = player.stance;
+        self.anims[A_THROW] = player.throw;
+        self.anims[A_SIDESTEP_LEFT] = player.step_left;
+        self.anims[A_SIDESTEP_RIGHT] = player.step_right;
+        self.anims[A_THROW_RELOAD] = player.reload;
+        self.guest = None;
+        if let Some(g) = &guest {
+            let Some(t) = Self::load_thrower(ctx, Skin::guest(g), ACTOR_RIVAL).await else { return false };
+            self.guest = Some(t);
         }
         let shared = [
             ("rock", A_ROCK),
@@ -306,7 +353,7 @@ impl ThrowScreen {
             let Some(h) = ctx.av.get_anim(&mut ctx.host, name).await else { return false };
             self.anims[slot] = h;
         }
-        if self.challenge_phase != PHASE_NORMAL {
+        if self.challenge_phase != PHASE_NORMAL && guest.is_none() {
             let thief = [
                 ("thief_throw_stance", A_THIEF_STANCE),
                 ("thief_throw_throw", A_THIEF_THROW),
@@ -321,13 +368,14 @@ impl ThrowScreen {
             rock.state = SLOT_FREE;
             rock.y = OFF_SCREEN;
         }
-        self.player_state = 0;
+        self.player.state = 0;
+        self.thief_state = 0;
         self.capn_state = 0;
         self.intro_step = 0;
         self.intro_waiting_voice = false;
         self.voice = 0;
         self.score = 0;
-        self.thief_score = 0;
+        self.rival_score = 0;
         self.seconds_left = 0x3c;
         self.timer_accum = 0.0;
         self.first_tick = true;
@@ -346,6 +394,11 @@ impl ThrowScreen {
             self.intro_active = false;
         }
         true
+    }
+
+    // True while the resident crunchling throws against the visiting friend's rather than the thief
+    fn versus(&self) -> bool {
+        self.guest.is_some()
     }
 
     // Runs one frame of input, motion, scoring and drawing and returns the next state
@@ -398,81 +451,22 @@ impl ThrowScreen {
                 }
             }
             let over = (self.challenge_phase == PHASE_NORMAL && self.seconds_left == 0)
-                || (self.challenge_phase != PHASE_NORMAL && (self.score > 9 || self.thief_score > 9));
+                || (self.challenge_phase != PHASE_NORMAL
+                    && (self.score >= WINNING_SCORE || self.rival_score >= WINNING_SCORE));
             if over {
-                self.outcome = if self.score < 10 || self.thief_score > 9 { OUTCOME_LOSE } else { OUTCOME_WIN };
-                if self.player_state != PS_GAME_OVER {
-                    if self.player_state != PS_STANCE {
-                        set_actor_anim(ctx, ACTOR_PLAYER, self.anims[A_STANCE], false, STATE_RESTART_FORWARD);
-                    }
-                    if self.challenge_phase != PHASE_NORMAL && self.thief_state != PS_STANCE {
-                        set_actor_anim(ctx, ACTOR_THIEF, self.anims[A_THIEF_STANCE], false, STATE_RESTART_FORWARD);
-                    }
-                    self.player_state = PS_GAME_OVER;
-                    if self.challenge_phase == PHASE_NORMAL {
-                        let old_high = format!("{}", ctx.player.throw_high_score);
-                        if ctx.player.throw_high_score < self.score {
-                            ctx.player.throw_high_score = self.score;
-                        }
-                        ctx.scene.set_text_by_id(OBJ_TIME, &old_high);
-                        ctx.scene.set_text_by_id(OBJ_TIME_TEXT, "High Score");
-                        self.voice = ctx.av.play_stream_sound(&mut ctx.host, "041.wav", false, self.voice).await;
-                        set_actor_anim(ctx, ACTOR_CAPN, self.anims[A_CAP_TV_006], false, STATE_RESTART_FORWARD);
-                        self.capn_state = CAPN_TV_TALKING;
-                        ctx.scene.set_hover_by_id(OBJ_DONE, HOVER_NORMAL);
-                        ctx.scene.set_hover_by_id(OBJ_GOOD_JOB, HOVER_NORMAL);
-                        ctx.scene.set_hover_by_id(OBJ_AGAIN, HOVER_NORMAL);
-                        ctx.cursor.set_visible(true);
-                    } else if self.outcome == OUTCOME_WIN {
-                        ctx.scene.set_hover_by_id(OBJ_GOOD_JOB, HOVER_NORMAL);
-                    }
+                self.outcome = match_outcome(self.score, self.rival_score);
+                if self.player.state != PS_GAME_OVER {
+                    self.end_game(ctx).await;
                 }
             } else {
-                if self.player_state != PS_THROWING && self.player_state != PS_RELOADING && ctx.av.is_key_down(KEY_SPACE) {
-                    if ctx.rand_range(0, 2) == 0 {
-                        ctx.av.play_sfx(self.sfx[S_ROCKTHROWER2], -1);
-                    } else {
-                        ctx.av.play_sfx(self.sfx[S_ROCKTHROWER], -1);
-                    }
-                    set_actor_anim(ctx, ACTOR_PLAYER, self.anims[A_THROW], true, STATE_RESTART_FORWARD);
-                    self.player_state = PS_THROWING;
-                    let speed = ctx.player.strength as f32 + 12.0;
-                    let dy = STAGE_TABLE[ctx.player.anim_index(false) as usize].rock_dy as f32;
-                    let dx = STAGE_TABLE[ctx.player.anim_index(false) as usize].rock_dx as f32;
-                    self.spawn_rock(ctx, ACTOR_PLAYER, dx, dy, speed);
-                }
-                if matches!(self.player_state, PS_RELOADING | PS_STANCE | PS_STEP_RIGHT | PS_STEP_LEFT) {
-                    let mut new_state = PS_STANCE;
-                    if ctx.av.is_key_down(KEY_RIGHT) {
-                        let (mut x, _) = ctx.actors.pos(ACTOR_PLAYER);
-                        x += STEP;
-                        if x > RIGHT_CLAMP {
-                            x = RIGHT_CLAMP;
-                        }
-                        ctx.actors.set_x(ACTOR_PLAYER, x);
-                        if self.player_state != PS_STEP_RIGHT && self.player_state != PS_RELOADING {
-                            set_actor_anim(ctx, ACTOR_PLAYER, self.anims[A_SIDESTEP_RIGHT], false, STATE_RESTART_FORWARD);
-                        }
-                        new_state = PS_STEP_RIGHT;
-                    }
-                    if ctx.av.is_key_down(KEY_LEFT) {
-                        let (mut x, _) = ctx.actors.pos(ACTOR_PLAYER);
-                        x -= STEP;
-                        if x < LEFT_CLAMP {
-                            x = LEFT_CLAMP;
-                        }
-                        ctx.actors.set_x(ACTOR_PLAYER, x);
-                        if self.player_state != PS_STEP_LEFT && self.player_state != PS_RELOADING {
-                            set_actor_anim(ctx, ACTOR_PLAYER, self.anims[A_SIDESTEP_LEFT], false, STATE_RESTART_FORWARD);
-                        }
-                        new_state = PS_STEP_LEFT;
-                    }
-                    if self.player_state != PS_STANCE && self.player_state != PS_RELOADING && new_state == PS_STANCE {
-                        set_actor_anim(ctx, ACTOR_PLAYER, self.anims[A_STANCE], false, STATE_RESTART_FORWARD);
-                    }
-                    if self.player_state != PS_RELOADING {
-                        self.player_state = new_state;
-                    }
+                let host_keys = ctx.held(false);
+                let mut player = self.player;
+                self.thrower_input(ctx, &mut player, host_keys);
+                self.player = player;
+                if let Some(mut guest) = self.guest {
+                    let guest_keys = ctx.held(true);
+                    self.thrower_input(ctx, &mut guest, guest_keys);
+                    self.guest = Some(guest);
                 }
                 if self.challenge_phase == PHASE_NORMAL {
                     let now = ctx.time_ms();
@@ -489,21 +483,10 @@ impl ThrowScreen {
                     }
                     let text = format!(" {}", self.seconds_left as u16);
                     ctx.scene.set_text_by_id(OBJ_TIME, &text);
-                } else if self.thief_state != PS_THROWING && self.thief_state != PS_RELOADING {
-                    if !ctx.session.helper_present() || ctx.helper_key_down(KEY_SPACE) {
-                        ctx.av.play_sfx(self.sfx[S_ROCKTHROWER2], -1);
-                        set_actor_anim(ctx, ACTOR_THIEF, self.anims[A_THIEF_THROW], true, STATE_RESTART_FORWARD);
-                        self.thief_state = PS_THROWING;
-                    } else {
-                        let (mut x, _) = ctx.actors.pos(ACTOR_THIEF);
-                        if ctx.helper_key_down(KEY_RIGHT) {
-                            x = (x + STEP).min(RIGHT_CLAMP);
-                        }
-                        if ctx.helper_key_down(KEY_LEFT) {
-                            x = (x - STEP).max(LEFT_CLAMP);
-                        }
-                        ctx.actors.set_x(ACTOR_THIEF, x);
-                    }
+                } else if !self.versus() && self.thief_state != PS_THROWING && self.thief_state != PS_RELOADING {
+                    ctx.av.play_sfx(self.sfx[S_ROCKTHROWER2], -1);
+                    set_actor_anim(ctx, ACTOR_RIVAL, self.anims[A_THIEF_THROW], true, STATE_RESTART_FORWARD);
+                    self.thief_state = PS_THROWING;
                 }
                 if self.challenge_phase == PHASE_NORMAL && self.ptero_respawn != 0 {
                     if self.ptero_respawn == 0x14 {
@@ -569,7 +552,7 @@ impl ThrowScreen {
             self.capn_state = CAPN_TV_IDLE;
             set_actor_anim(ctx, ACTOR_CAPN, self.anims[A_CAP_TV_005], false, STATE_RESTART_FORWARD);
         }
-        if self.player_state != PS_GAME_OVER {
+        if self.player.state != PS_GAME_OVER {
             if self.erupt_cooldown == 0 {
                 self.try_erupt(ctx);
             } else {
@@ -578,7 +561,7 @@ impl ThrowScreen {
         }
         ctx.scene.draw_layer(&mut ctx.av, 0);
         let old_score = self.score;
-        let old_thief_score = self.thief_score;
+        let old_rival_score = self.rival_score;
         for slot in 0..ROCK_SLOTS {
             if self.rocks[slot].state != SLOT_FLYING {
                 continue;
@@ -591,8 +574,8 @@ impl ThrowScreen {
                         self.advance_intro(ctx).await;
                     } else if self.rocks[slot].owner == ACTOR_PLAYER {
                         self.score += 1;
-                    } else if self.rocks[slot].owner == ACTOR_THIEF {
-                        self.thief_score += 1;
+                    } else if self.rocks[slot].owner == ACTOR_RIVAL {
+                        self.rival_score += 1;
                     }
                     ctx.av.play_sfx(self.sfx[S_RIMPACT], -1);
                     self.rocks[slot].state = SLOT_HIT;
@@ -605,8 +588,8 @@ impl ThrowScreen {
                     ctx.av.play_sfx(self.sfx[S_TERAHIT], -1);
                     if self.rocks[slot].owner == ACTOR_PLAYER {
                         self.score += 3;
-                    } else if self.rocks[slot].owner == ACTOR_THIEF {
-                        self.thief_score += 3;
+                    } else if self.rocks[slot].owner == ACTOR_RIVAL {
+                        self.rival_score += 3;
                     }
                     self.rocks[slot].state = SLOT_HIT;
                     set_actor_anim(ctx, rock_id, self.anims[A_ROCK_IMPACT], true, STATE_RESTART_FORWARD);
@@ -632,8 +615,8 @@ impl ThrowScreen {
                 }
             }
         }
-        if self.challenge_phase != PHASE_NORMAL && old_thief_score != self.thief_score {
-            let text = format!("{}", self.thief_score);
+        if self.challenge_phase != PHASE_NORMAL && old_rival_score != self.rival_score {
+            let text = format!("{}", self.rival_score);
             ctx.scene.set_text_by_id(OBJ_TIME, &text);
         }
         ctx.actors.draw(&mut ctx.av, &ctx.scene, LAYER_MAIN);
@@ -645,14 +628,99 @@ impl ThrowScreen {
         if ctx.av.is_key_down(KEY_ESC) {
             ret = STATE_HOME_WORLD;
         }
-        if self.challenge_phase != PHASE_NORMAL && self.player_state == PS_GAME_OVER {
+        if self.challenge_phase != PHASE_NORMAL && self.player.state == PS_GAME_OVER {
             self.exit_frames += 1;
             if self.exit_frames > 0x78 {
                 ctx.player.challenge_won = (self.outcome == OUTCOME_WIN) as u8;
-                ret = STATE_CHALLENGE;
+                ret = if self.versus() { STATE_HOME_WORLD } else { STATE_CHALLENGE };
             }
         }
         ret
+    }
+
+    // Throws on space and sidesteps on the arrows for one crunchling, reading the side's own keys
+    fn thrower_input<H: Host>(&mut self, ctx: &mut Ctx<H>, t: &mut Thrower, held: Held) {
+        if t.state != PS_THROWING && t.state != PS_RELOADING && held.space {
+            if ctx.rand_range(0, 2) == 0 {
+                ctx.av.play_sfx(self.sfx[S_ROCKTHROWER2], -1);
+            } else {
+                ctx.av.play_sfx(self.sfx[S_ROCKTHROWER], -1);
+            }
+            set_actor_anim(ctx, t.actor, t.throw, true, STATE_RESTART_FORWARD);
+            t.state = PS_THROWING;
+            self.spawn_rock(ctx, t.actor, t.rock_dx, t.rock_dy, t.rock_speed);
+        }
+        if matches!(t.state, PS_RELOADING | PS_STANCE | PS_STEP_RIGHT | PS_STEP_LEFT) {
+            let mut new_state = PS_STANCE;
+            if held.right {
+                let (mut x, _) = ctx.actors.pos(t.actor);
+                x += STEP;
+                if x > RIGHT_CLAMP {
+                    x = RIGHT_CLAMP;
+                }
+                ctx.actors.set_x(t.actor, x);
+                if t.state != PS_STEP_RIGHT && t.state != PS_RELOADING {
+                    set_actor_anim(ctx, t.actor, t.step_right, false, STATE_RESTART_FORWARD);
+                }
+                new_state = PS_STEP_RIGHT;
+            }
+            if held.left {
+                let (mut x, _) = ctx.actors.pos(t.actor);
+                x -= STEP;
+                if x < LEFT_CLAMP {
+                    x = LEFT_CLAMP;
+                }
+                ctx.actors.set_x(t.actor, x);
+                if t.state != PS_STEP_LEFT && t.state != PS_RELOADING {
+                    set_actor_anim(ctx, t.actor, t.step_left, false, STATE_RESTART_FORWARD);
+                }
+                new_state = PS_STEP_LEFT;
+            }
+            if t.state != PS_STANCE && t.state != PS_RELOADING && new_state == PS_STANCE {
+                set_actor_anim(ctx, t.actor, t.stance, false, STATE_RESTART_FORWARD);
+            }
+            if t.state != PS_RELOADING {
+                t.state = new_state;
+            }
+        }
+    }
+
+    // Poses everyone for the result, shows the high score or the winner and ends the round
+    async fn end_game<H: Host>(&mut self, ctx: &mut Ctx<H>) {
+        if self.player.state != PS_STANCE {
+            set_actor_anim(ctx, ACTOR_PLAYER, self.player.stance, false, STATE_RESTART_FORWARD);
+        }
+        if let Some(mut guest) = self.guest {
+            if guest.state != PS_STANCE {
+                set_actor_anim(ctx, ACTOR_RIVAL, guest.stance, false, STATE_RESTART_FORWARD);
+            }
+            guest.state = PS_GAME_OVER;
+            self.guest = Some(guest);
+        } else if self.challenge_phase != PHASE_NORMAL && self.thief_state != PS_STANCE {
+            set_actor_anim(ctx, ACTOR_RIVAL, self.anims[A_THIEF_STANCE], false, STATE_RESTART_FORWARD);
+        }
+        self.player.state = PS_GAME_OVER;
+        if self.challenge_phase == PHASE_NORMAL {
+            let old_high = format!("{}", ctx.player.throw_high_score);
+            if ctx.player.throw_high_score < self.score {
+                ctx.player.throw_high_score = self.score;
+            }
+            ctx.scene.set_text_by_id(OBJ_TIME, &old_high);
+            ctx.scene.set_text_by_id(OBJ_TIME_TEXT, "High Score");
+            self.voice = ctx.av.play_stream_sound(&mut ctx.host, "041.wav", false, self.voice).await;
+            set_actor_anim(ctx, ACTOR_CAPN, self.anims[A_CAP_TV_006], false, STATE_RESTART_FORWARD);
+            self.capn_state = CAPN_TV_TALKING;
+            ctx.scene.set_hover_by_id(OBJ_DONE, HOVER_NORMAL);
+            ctx.scene.set_hover_by_id(OBJ_GOOD_JOB, HOVER_NORMAL);
+            ctx.scene.set_hover_by_id(OBJ_AGAIN, HOVER_NORMAL);
+            ctx.cursor.set_visible(true);
+        } else if self.versus() {
+            let winner = if self.outcome == OUTCOME_WIN { ctx.player.name_str() } else { ctx.session.guest_name() };
+            ctx.scene.set_text_by_id(OBJ_GOOD_JOB, &wins_text(&winner));
+            ctx.scene.set_hover_by_id(OBJ_GOOD_JOB, HOVER_NORMAL);
+        } else if self.outcome == OUTCOME_WIN {
+            ctx.scene.set_hover_by_id(OBJ_GOOD_JOB, HOVER_NORMAL);
+        }
     }
 
     // Steps the first time tutorial cutscene through lightning, juricar, Cap'n talk and demo throw
@@ -846,16 +914,23 @@ impl ThrowScreen {
     async fn on_init_object<H: Host>(&mut self, ctx: &mut Ctx<H>, actor_id: i32) {
         match actor_id {
             ACTOR_PLAYER => {
-                set_actor_anim(ctx, actor_id, self.anims[A_STANCE], false, STATE_RESTART_FORWARD);
-                ctx.actors.set_pos(actor_id, 300.0, 320.0);
+                set_actor_anim(ctx, actor_id, self.player.stance, false, STATE_RESTART_FORWARD);
+                ctx.actors.set_pos(actor_id, PLAYER_START.0, PLAYER_START.1);
                 ctx.actors.face(&ctx.av, actor_id, FACING_NONE);
-                self.player_state = PS_STANCE;
+                self.player.state = PS_STANCE;
             }
-            ACTOR_THIEF => {
-                set_actor_anim(ctx, actor_id, self.anims[A_THIEF_STANCE], false, STATE_RESTART_FORWARD);
-                ctx.actors.set_pos(actor_id, 440.0, 232.0);
+            ACTOR_RIVAL => {
+                if let Some(mut guest) = self.guest {
+                    set_actor_anim(ctx, actor_id, guest.stance, false, STATE_RESTART_FORWARD);
+                    ctx.actors.set_pos(actor_id, GUEST_START.0, GUEST_START.1);
+                    guest.state = PS_STANCE;
+                    self.guest = Some(guest);
+                } else {
+                    set_actor_anim(ctx, actor_id, self.anims[A_THIEF_STANCE], false, STATE_RESTART_FORWARD);
+                    ctx.actors.set_pos(actor_id, THIEF_START.0, THIEF_START.1);
+                    self.thief_state = PS_STANCE;
+                }
                 ctx.actors.face(&ctx.av, actor_id, FACING_NONE);
-                self.thief_state = PS_STANCE;
             }
             2..=5 => {
                 set_actor_anim(ctx, actor_id, self.anims[A_ROCK], false, STATE_RESTART_FORWARD);
@@ -892,21 +967,31 @@ impl ThrowScreen {
         }
     }
 
+    // Reloads after a throw and returns to the stance for either crunchling
+    fn thrower_anim_end<H: Host>(ctx: &mut Ctx<H>, t: &mut Thrower) {
+        if t.state == PS_THROWING {
+            set_actor_anim(ctx, t.actor, t.reload, true, STATE_RESTART_FORWARD);
+            t.state = PS_RELOADING;
+        } else if t.state != PS_GAME_OVER {
+            t.state = PS_STANCE;
+            set_actor_anim(ctx, t.actor, t.stance, false, STATE_RESTART_FORWARD);
+        }
+    }
+
     // Finishes a reload, clears a spent rock or lavaball, ends an eruption or steps the intro
     async fn on_anim_end<H: Host>(&mut self, ctx: &mut Ctx<H>, actor_id: i32) {
         match actor_id {
             ACTOR_PLAYER => {
-                if self.player_state == PS_THROWING {
-                    set_actor_anim(ctx, actor_id, self.anims[A_THROW_RELOAD], true, STATE_RESTART_FORWARD);
-                    self.player_state = PS_RELOADING;
-                } else {
-                    self.player_state = PS_STANCE;
-                    set_actor_anim(ctx, actor_id, self.anims[A_STANCE], false, STATE_RESTART_FORWARD);
-                }
+                let mut player = self.player;
+                Self::thrower_anim_end(ctx, &mut player);
+                self.player = player;
             }
-            ACTOR_THIEF => {
-                if self.thief_state == PS_THROWING {
-                    self.spawn_rock(ctx, ACTOR_THIEF, 30.0, -30.0, 12.0);
+            ACTOR_RIVAL => {
+                if let Some(mut guest) = self.guest {
+                    Self::thrower_anim_end(ctx, &mut guest);
+                    self.guest = Some(guest);
+                } else if self.thief_state == PS_THROWING {
+                    self.spawn_rock(ctx, ACTOR_RIVAL, 30.0, -30.0, 12.0);
                     set_actor_anim(ctx, actor_id, self.anims[A_THIEF_RELOAD], true, STATE_RESTART_FORWARD);
                     self.thief_state = PS_RELOADING;
                 } else {
@@ -982,6 +1067,24 @@ mod tests {
         p.stage = 2;
         let adult = STAGE_TABLE[p.anim_index(false) as usize];
         assert_eq!((adult.draw_off_x, adult.draw_off_y, adult.rock_dx, adult.rock_dy), (0, -31, 0, 0));
+    }
+
+    #[test]
+    fn thrower_numbers_follow_strength_and_form() {
+        let mut p = PlayerData { strength: 7, ..Default::default() };
+        let mut t = Thrower::default();
+        t.numbers(&p);
+        assert_eq!((t.rock_speed, t.rock_dx, t.rock_dy), (19.0, 3.0, 35.0));
+        p.stage = 2;
+        t.numbers(&p);
+        assert_eq!((t.rock_dx, t.rock_dy), (0.0, 0.0));
+    }
+
+    #[test]
+    fn match_goes_to_the_higher_score() {
+        assert_eq!(match_outcome(10, 3), OUTCOME_WIN);
+        assert_eq!(match_outcome(9, 10), OUTCOME_LOSE);
+        assert_eq!(match_outcome(10, 10), OUTCOME_LOSE);
     }
 
     #[test]
