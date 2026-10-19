@@ -39,6 +39,9 @@ pub trait Host {
 
     fn open_url(&mut self, url: &str);
 
+    // Shows or hides host provided credits content and returns true when the host has any
+    fn show_credits(&mut self, shown: bool) -> bool;
+
     fn launch_setup(&mut self);
 
     fn log(&mut self, message: &str);

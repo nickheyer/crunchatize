@@ -15,7 +15,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
     AudioContext, AudioContextOptions, AudioContextState, AudioWorkletNode, AudioWorkletNodeOptions, Cache,
-    CanvasRenderingContext2d, HtmlCanvasElement, ImageData, KeyboardEvent, PointerEvent, ReadableStreamDefaultReader,
+    CanvasRenderingContext2d, HtmlCanvasElement, HtmlElement, ImageData, KeyboardEvent, PointerEvent, ReadableStreamDefaultReader,
     ReadableStreamReadResult, Request, Response, Url, Window,
 };
 
@@ -72,6 +72,7 @@ impl Pack {
 pub struct WebHost {
     pack: Pack,
     canvas: HtmlCanvasElement,
+    credits: HtmlElement,
     ctx2d: CanvasRenderingContext2d,
     rgba: Vec<u8>,
     audio: SharedAudio,
@@ -253,6 +254,11 @@ impl Host for WebHost {
         if let Some(w) = web_sys::window() {
             let _ = w.open_with_url_and_target(url, "_blank");
         }
+    }
+
+    fn show_credits(&mut self, shown: bool) -> bool {
+        self.credits.set_hidden(!shown);
+        true
     }
 
     fn launch_setup(&mut self) {
@@ -537,7 +543,12 @@ fn attach_input(canvas: &HtmlCanvasElement, input: Rc<RefCell<InputState>>) {
 
 // Boots the game on a canvas after loading the pack version the data URL currently serves
 #[wasm_bindgen]
-pub async fn start(canvas: HtmlCanvasElement, data_url: String, worklet_url: String) -> Result<(), JsValue> {
+pub async fn start(
+    canvas: HtmlCanvasElement,
+    credits: HtmlElement,
+    data_url: String,
+    worklet_url: String,
+) -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
     let window = web_sys::window().ok_or("no window")?;
     canvas.set_width(WIDTH);
@@ -563,6 +574,7 @@ pub async fn start(canvas: HtmlCanvasElement, data_url: String, worklet_url: Str
     let host = WebHost {
         pack,
         canvas: canvas.clone(),
+        credits,
         ctx2d,
         rgba: vec![0; (WIDTH * HEIGHT * 4) as usize],
         audio,

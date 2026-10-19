@@ -256,6 +256,10 @@ impl Host for HeadlessHost {
         println!("open {url}");
     }
 
+    fn show_credits(&mut self, _shown: bool) -> bool {
+        false
+    }
+
     fn launch_setup(&mut self) {
         println!("launch Setup.exe");
     }

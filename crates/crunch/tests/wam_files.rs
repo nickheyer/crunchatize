@@ -95,6 +95,10 @@ impl Host for DirHost {
 
     fn open_url(&mut self, _url: &str) {}
 
+    fn show_credits(&mut self, _shown: bool) -> bool {
+        false
+    }
+
     fn launch_setup(&mut self) {}
 
     fn log(&mut self, message: &str) {

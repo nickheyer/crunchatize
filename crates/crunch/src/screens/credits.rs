@@ -1,7 +1,9 @@
 use crate::ctx::{Ctx, KEY_ESC, MOUSE_LEFT, RESULT_CONTINUE, STATE_LOAD_CRUNCH, Screen};
 use crate::host::Host;
+use crate::scene::HOVER_HIDDEN;
 
 const ID_DONE: i32 = 1;
+const ID_ART: i32 = 2;
 
 // Credits roll with looping music and a done button back to the save picker
 #[derive(Default)]
@@ -28,6 +30,7 @@ impl CreditsScreen {
 }
 
 impl<H: Host> Screen<H> for CreditsScreen {
+    // Loads the scene and hides the original credits art when the host shows credits of its own
     async fn init(&mut self, ctx: &mut Ctx<H>) -> bool {
         let Some(h) = ctx.av.get_anim(&mut ctx.host, "mouse").await else { return false };
         self.mouse_anim = h;
@@ -38,6 +41,10 @@ impl<H: Host> Screen<H> for CreditsScreen {
         self.button_sfx = h;
         ctx.scene.load(&mut ctx.av, &mut ctx.host, "credits").await;
         ctx.scene.assign_id("done", ID_DONE);
+        if ctx.host.show_credits(true) {
+            ctx.scene.assign_id("new", ID_ART);
+            ctx.scene.set_hover_by_id(ID_ART, HOVER_HIDDEN);
+        }
         self.music_channel = ctx.av.play_stream_sound(&mut ctx.host, "crunchsong3.wav", true, 0).await;
         true
     }
@@ -64,6 +71,7 @@ impl<H: Host> Screen<H> for CreditsScreen {
     }
 
     fn shutdown(&mut self, ctx: &mut Ctx<H>) {
+        ctx.host.show_credits(false);
         ctx.av.kill_streaming_channel(self.music_channel);
     }
 }

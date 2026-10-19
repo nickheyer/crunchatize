@@ -748,7 +748,7 @@ impl<H: Host> Screen<H> for RunningScreen {
             if (self.state == PS_SKATING || self.state == PS_RIDING) && ctx.av.is_key_down(KEY_SPACE) {
                 ctx.av.play_sfx(s[SFX_JUMP], -1);
                 ctx.actors.set_anims(&ctx.av, ACTOR_PLAYER, a[A_JUMP], a[A_JUMP], false, STATE_RESTART_FORWARD);
-                ctx.actors.set_gravity(ACTOR_PLAYER, -12.0, 1.5, ftol(f64::from(self.ground_y)), 100.0);
+                ctx.actors.set_gravity(ACTOR_PLAYER, -24.0, 1.5, ftol(f64::from(self.ground_y)), 100.0);
                 if self.state == PS_RIDING {
                     ctx.actors.set_anims(&ctx.av, ACTOR_PLAYER, a[A_SPIN], a[A_SPIN], false, STATE_RESTART_FORWARD);
                     ctx.actors.add_y(ACTOR_PLAYER, -20.0);
