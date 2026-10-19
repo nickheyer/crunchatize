@@ -1,0 +1,10 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "crunchatize",
+  "main": "worker/index.js",
+  "compatibility_date": "2026-10-01",
+  "account_id": "c55165de3f6779b09770686ed067f5a3",
+  "assets": { "directory": "web" },
+  "r2_buckets": [{ "binding": "DATA", "bucket_name": "crunchatize-data" }],
+  "routes": [{ "pattern": "crunchatize.app", "custom_domain": true }]
+}

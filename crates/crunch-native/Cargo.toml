@@ -1,0 +1,16 @@
+[package]
+name = "crunch-native"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "crunch"
+path = "src/main.rs"
+
+[dependencies]
+avmanager = { path = "../avmanager" }
+crunch = { path = "../crunch" }
+cpal = "0.18"
+minifb = "0.29"

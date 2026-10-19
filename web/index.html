@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crunchling Adventure</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #ddd; font-family: sans-serif; }
+  body { display: flex; align-items: center; justify-content: center; }
+  #game { width: min(100vw, calc(100vh * 4 / 3)); aspect-ratio: 4 / 3; image-rendering: pixelated; cursor: none; background: #000; outline: none; }
+</style>
+</head>
+<body>
+<canvas id="game" tabindex="0"></canvas>
+<script type="module">
+  import init, { start } from './pkg/crunch_web.js';
+  await init();
+  await start(document.getElementById('game'), './data/', './worklet.js');
+</script>
+</body>
+</html>
