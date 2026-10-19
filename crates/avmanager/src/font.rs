@@ -4,7 +4,7 @@ use crate::anim::{AnimFrame, AnimManager, STATE_STOPPED};
 use crate::crt::{asset_key, atoi, stricmp};
 use crate::display::Display;
 use crate::rect::Rect;
-use crate::texture::BitmapManager;
+use crate::texture::{BitmapManager, Texture, average_565};
 
 pub const ALIGN_LEFT: i32 = 0;
 pub const ALIGN_CENTER: i32 = 1;
@@ -200,6 +200,21 @@ impl FontManager {
         self.slots[font as usize].height as i32
     }
 
+    pub fn anim(&self, font: u32) -> u16 {
+        self.slots[font as usize].anim
+    }
+
+    pub fn glyph(&self, font: u32, ch: u8) -> Option<Glyph> {
+        Self::glyph_of(&self.slots[font as usize], ch)
+    }
+
+    // Registers one more sheet cell as the glyph of an ASCII character
+    pub fn add_glyph(&mut self, font: u32, ch: u8, glyph: Glyph) {
+        let rec = &mut self.slots[font as usize];
+        rec.map[usize::from(ch)] = rec.glyphs.len() as u8;
+        rec.glyphs.push(glyph);
+    }
+
     fn glyph_of(rec: &FontRecord, ch: u8) -> Option<Glyph> {
         if ch >= 128 {
             return None;
@@ -263,6 +278,43 @@ impl FontManager {
                 anims.draw_clip(&mut af, x as i16, y, &mut clip, bitmaps, display);
             }
     }
+
+    // Paints text into a texture at half size, averaging each 2x2 glyph block that is mostly ink
+    #[allow(clippy::too_many_arguments)]
+    pub fn stamp_half(
+        &self,
+        text: &str,
+        font: u32,
+        x: i32,
+        y: i32,
+        anims: &AnimManager,
+        bitmaps: &BitmapManager,
+        target: &mut Texture,
+    ) {
+        let rec = &self.slots[font as usize];
+        let sheet = bitmaps.get(anims.frame_bitmap(rec.anim, 0));
+        let mut pen = x;
+        for &ch in text.as_bytes() {
+            if ch == b' ' {
+                pen += i32::from(rec.width) / 2;
+                continue;
+            }
+            let Some(g) = Self::glyph_of(rec, ch) else { continue };
+            let cols = (i32::from(g.right) - i32::from(g.left) + 1) / 2;
+            let rows = (i32::from(g.bottom) - i32::from(g.top) + 1) / 2;
+            for by in 0..rows {
+                for bx in 0..cols {
+                    let (sx, sy) = (i32::from(g.left) + bx * 2, i32::from(g.top) + by * 2);
+                    let block = [sheet.pixel(sx, sy), sheet.pixel(sx + 1, sy), sheet.pixel(sx, sy + 1), sheet.pixel(sx + 1, sy + 1)];
+                    let ink: Vec<u16> = block.into_iter().filter(|&p| Some(p) != sheet.key).collect();
+                    if 2 <= ink.len() {
+                        target.put(pen + bx, y + by, average_565(&ink));
+                    }
+                }
+            }
+            pen += (i32::from(g.right) - i32::from(g.left) - 1) / 2;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -287,5 +339,50 @@ mod tests {
         assert_eq!((rec.glyphs[2].left, rec.glyphs[2].top), (0, 10));
         assert_eq!(rec.map[b'a' as usize], 0);
         assert_eq!(m.text_width("AB C", h as u32, 0), 8 + 8 + 10 + 8);
+    }
+
+    #[test]
+    fn added_glyph_becomes_measurable_and_printable() {
+        let f = parse_fnt(b"#BAM x.bam\r\n#WIDTH 10\r\n#HEIGHT 10\r\nA\r\n").unwrap();
+        let mut m = FontManager::default();
+        let h = m.install("font.fnt", &f, 0, [0, 0, 25, 100]);
+        assert_eq!(m.text_width("-", h as u32, 0), 0);
+        m.add_glyph(h as u32, b'-', Glyph { left: 0, top: 10, right: 9, bottom: 19 });
+        assert_eq!(m.glyph(h as u32, b'-').map(|g| g.top), Some(10));
+        assert_eq!(m.text_width("A-", h as u32, 0), 16);
+    }
+
+    #[test]
+    fn stamp_half_shrinks_glyph_blocks_and_skips_key_pixels() {
+        use crate::bam::{Bam, Bitmap, Frame, Pixels};
+        use crate::texture::{BitmapManager, Texture, color_key_565};
+        let key = color_key_565(0x00ff00);
+        let ink = 0xffff;
+        // One 4x4 glyph cell, its right half key colored
+        let pixels: Vec<u16> = (0..16).map(|i| if i % 4 < 2 { ink } else { key }).collect();
+        let bam = Bam {
+            version: 1,
+            transparent: true,
+            color_key: 0x00ff00,
+            loop_mode: 0,
+            fps: 10,
+            bbox: [0, 0, 8, 4],
+            palette: Vec::new(),
+            frames: vec![Frame { x: 0, y: 0, bitmap: Bitmap { width: 4, height: 4, hot_x: 0, hot_y: 0, pixels: Pixels::Rgb565(pixels) } }],
+        };
+        let mut bitmaps = BitmapManager::default();
+        let mut anims = AnimManager::default();
+        let sheet = anims.load("sheet", &bam, &mut bitmaps, None, false);
+        let f = parse_fnt(b"#BAM sheet
+#WIDTH 4
+#HEIGHT 4
+A
+").unwrap();
+        let mut fonts = FontManager::default();
+        let font = fonts.install("f", &f, sheet, bam.bbox);
+        let mut target = Texture { width: 6, height: 6, hot_x: 0, hot_y: 0, pixels: vec![0; 36], key: None, source: None };
+        fonts.stamp_half("A", u32::from(font), 1, 2, &anims, &bitmaps, &mut target);
+        let painted: Vec<(i32, i32)> = (0..6).flat_map(|y| (0..6).map(move |x| (x, y))).filter(|&(x, y)| target.pixel(x, y) == ink).collect();
+        assert_eq!(painted, vec![(1, 2), (1, 3)]);
     }
 }

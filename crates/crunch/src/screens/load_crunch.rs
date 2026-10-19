@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use avmanager::anim::STATE_RESTART_FORWARD;
 use avmanager::texture::Palette24;
 
@@ -5,9 +7,10 @@ use crate::actors::EVENT_INIT_OBJECT;
 use crate::ctx::{
     Ctx, KEY_ESC, MOUSE_LEFT, RESULT_CONTINUE, RESULT_QUIT, STATE_CREATE, STATE_CREDITS, STATE_HOME_WORLD, Screen,
 };
+use crate::game::COFFEE_URL;
 use crate::host::Host;
 use crate::player::{PlayerData, load_player};
-use crate::scene::{HOVER_HIDDEN, HOVER_NORMAL};
+use crate::scene::{HOVER_HIDDEN, HOVER_NORMAL, NO_HANDLE};
 use crate::video::play_video_modal;
 
 const ID_CREATE: i32 = 1;
@@ -18,13 +21,20 @@ const ID_DONE: i32 = 5;
 const ID_NAME: i32 = 6;
 const ID_CREDITS: i32 = 7;
 const ID_VIEW_STORY: i32 = 8;
-const ID_AOL: i32 = 9;
+const ID_COFFEE: i32 = 9;
 const ID_DELETE: i32 = 10;
 const ID_DELETE_BOX: i32 = 11;
 const ID_YES: i32 = 12;
 const ID_NO: i32 = 13;
 
 const CRUNCHLING_ACTOR: i32 = 0;
+
+const COFFEE_LABEL: &str = "Buy me a coffee";
+
+// Band of the InstallAOLMenu plates holding the AOL Free Trial lettering and a clean column beside it
+const LABEL_ROWS: Range<i32> = 19..40;
+const LABEL_COLS: Range<i32> = 48..218;
+const LABEL_FILL_COL: i32 = 45;
 const ACTOR_LAYER_MASK: u32 = 0xf;
 
 // Blink animation per form, baby then the three teen types then the three adult types
@@ -103,10 +113,7 @@ impl LoadCrunchScreen {
             ID_DONE => result = STATE_HOME_WORLD,
             ID_CREDITS => result = STATE_CREDITS,
             ID_VIEW_STORY => play_video_modal(&mut ctx.av, &mut ctx.host, "Intro.smk").await,
-            ID_AOL => {
-                result = RESULT_QUIT;
-                ctx.globals.launch_setup = true;
-            }
+            ID_COFFEE => ctx.host.open_url(COFFEE_URL),
             ID_DELETE => {
                 self.delete_confirm = true;
                 for id in [ID_DELETE_BOX, ID_YES, ID_NO] {
@@ -172,11 +179,14 @@ impl<H: Host> Screen<H> for LoadCrunchScreen {
         ctx.scene.assign_id("name", ID_NAME);
         ctx.scene.assign_id("credits", ID_CREDITS);
         ctx.scene.assign_id("ViewStory", ID_VIEW_STORY);
-        ctx.scene.assign_id("AOL", ID_AOL);
+        ctx.scene.assign_id("AOL", ID_COFFEE);
         ctx.scene.assign_id("Delete", ID_DELETE);
         ctx.scene.assign_id("DeleteBox", ID_DELETE_BOX);
         ctx.scene.assign_id("Yes", ID_YES);
         ctx.scene.assign_id("No", ID_NO);
+        if !relabel_coffee_button(ctx).await {
+            return false;
+        }
         ctx.scene.set_hover_by_id(ID_DELETE_BOX, HOVER_HIDDEN);
         ctx.scene.set_hover_by_id(ID_YES, HOVER_HIDDEN);
         ctx.scene.set_hover_by_id(ID_NO, HOVER_HIDDEN);
@@ -236,6 +246,30 @@ impl<H: Host> Screen<H> for LoadCrunchScreen {
     fn shutdown(&mut self, ctx: &mut Ctx<H>) {
         ctx.av.kill_streaming_channel(self.music_channel);
     }
+}
+
+// Repaints both AOL plates with the coffee label at the scale of the original lettering
+async fn relabel_coffee_button<H: Host>(ctx: &mut Ctx<H>) -> bool {
+    let Some(font) = ctx.av.get_font(&mut ctx.host, "font").await else { return false };
+    let Some(button) = ctx.scene.objects.iter().find(|o| o.state != 0 && o.id == ID_COFFEE) else { return false };
+    let width = ctx.av.calc_text_size(COFFEE_LABEL, u32::from(font), 0) / 2;
+    let height = ctx.av.get_font_height(u32::from(font)) / 2;
+    for af in button.anims.iter().filter(|af| af.anim != NO_HANDLE) {
+        let bitmap = ctx.av.anims.frame_bitmap(af.anim, 0);
+        let mut plate = ctx.av.bitmaps.get(bitmap).clone();
+        for y in LABEL_ROWS {
+            let fill = plate.pixel(LABEL_FILL_COL, y);
+            for x in LABEL_COLS {
+                plate.put(x, y, fill);
+            }
+        }
+        let x = (i32::from(plate.width) - width) / 2;
+        let y = (i32::from(plate.height) - height) / 2;
+        ctx.av.fonts.stamp_half(COFFEE_LABEL, u32::from(font), x, y, &ctx.av.anims, &ctx.av.bitmaps, &mut plate);
+        plate.source = None;
+        *ctx.av.bitmaps.get_mut(bitmap) = plate;
+    }
+    true
 }
 
 // Removes every save file, not only the selected one
@@ -337,8 +371,6 @@ mod tests {
         fn show_credits(&mut self, _shown: bool) -> bool {
             false
         }
-
-        fn launch_setup(&mut self) {}
 
         fn log(&mut self, _message: &str) {}
     }

@@ -260,10 +260,6 @@ impl Host for HeadlessHost {
         false
     }
 
-    fn launch_setup(&mut self) {
-        println!("launch Setup.exe");
-    }
-
     fn log(&mut self, message: &str) {
         eprintln!("{message}");
     }

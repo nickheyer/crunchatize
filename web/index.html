@@ -9,20 +9,30 @@
   body { display: flex; align-items: center; justify-content: center; }
   #stage { position: relative; width: min(100vw, calc(100vh * 4 / 3)); aspect-ratio: 4 / 3; container-type: size; }
   #game { display: block; width: 100%; height: 100%; image-rendering: pixelated; cursor: none; touch-action: none; background: #000; outline: none; }
-  #credits { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5cqh; pointer-events: none; }
+  #credits { position: absolute; inset: 0; pointer-events: none; }
   #credits[hidden] { display: none; }
-  #credits a { pointer-events: auto; color: #fff; text-decoration: none; }
-  #credits img { display: block; width: 28cqh; height: 28cqh; border-radius: 50%; }
-  #credits .name { font: 600 7cqh/1 Poppins, sans-serif; }
+  #credits a { pointer-events: auto; }
+  #credits .avatar { position: absolute; top: 8.96%; left: 50%; width: 31.25cqh; height: 31.25cqh; transform: translateX(-50%); }
+  #credits .avatar img { display: block; width: 100%; height: 100%; border-radius: 50%; object-fit: cover; }
+  #credits .coffee, #credits .github { position: absolute; left: 50%; transform: translateX(-50%); }
+  #credits .coffee { top: 66.67%; }
+  #credits .github { top: 78.75%; }
+  #credits .bmc-btn { height: 9cqh !important; min-width: 0 !important; padding: 0 3cqw !important; border-radius: 2cqh !important; font-size: 4.2cqh !important; line-height: 1 !important; white-space: nowrap; }
+  #credits .bmc-btn.gh-btn { background-color: #24292f !important; color: #fff !important; }
+  #credits .gh-btn svg { width: 5cqh; height: 5cqh; fill: #fff; flex-shrink: 0; }
 </style>
 </head>
 <body>
 <div id="stage">
   <canvas id="game" tabindex="0"></canvas>
   <div id="credits" hidden>
-    <a href="https://github.com/nickheyer" target="_blank" rel="noopener"><img src="https://github.com/nickheyer.png?size=240" alt="Nicholas W. Heyer"></a>
-    <a class="name" href="https://github.com/nickheyer" target="_blank" rel="noopener">Nicholas W. Heyer</a>
-    <script type="text/javascript" src="https://cdnjs.buymeacoffee.com/1.0.0/button.prod.min.js" data-name="bmc-button" data-slug="nickheyer" data-color="#BD5FFF" data-emoji="☕"  data-font="Poppins" data-text="Buy me a coffee" data-outline-color="#000000" data-font-color="#ffffff" data-coffee-color="#FFDD00" ></script>
+    <a class="avatar" href="https://buymeacoffee.com/nickheyer" target="_blank" rel="noopener"><img src="https://cdn.buymeacoffee.com/uploads/profile_pictures/2026/10/s0y37aW4VOsbhZT1.jpg@300w_0e.jpg" alt="Nick"></a>
+    <div class="coffee">
+      <script type="text/javascript" src="https://cdnjs.buymeacoffee.com/1.0.0/button.prod.min.js" data-name="bmc-button" data-slug="nickheyer" data-color="#BD5FFF" data-emoji="☕"  data-font="Poppins" data-text="Buy me a coffee" data-outline-color="#000000" data-font-color="#ffffff" data-coffee-color="#FFDD00" ></script>
+    </div>
+    <div class="github">
+      <div class="bmc-btn-container"><a class="bmc-btn gh-btn" target="_blank" rel="noopener" href="https://github.com/nickheyer"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span class="bmc-btn-text">GitHub</span></a></div>
+    </div>
   </div>
 </div>
 <script type="module">

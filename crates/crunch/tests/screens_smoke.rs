@@ -119,8 +119,6 @@ impl Host for SmokeHost {
         false
     }
 
-    fn launch_setup(&mut self) {}
-
     fn log(&mut self, message: &str) {
         eprintln!("{message}");
     }

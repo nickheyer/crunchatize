@@ -12,6 +12,7 @@ use crate::ctx::{
     RESULT_CONTINUE, RESULT_QUIT, STATE_CHALLENGE, STATE_HOME_WORLD, STATE_JUMPING, STATE_RUNNING, STATE_THROWING,
     Screen,
 };
+use crate::game::ONLINE_URL;
 use crate::host::Host;
 use crate::player::PlayerData;
 use crate::scene::{HOVER_HIDDEN, HOVER_NORMAL, HOVER_PRESSED};
@@ -726,10 +727,7 @@ impl HomeWorldScreen {
                 }
             }
             OBJ_QUIT => result = RESULT_QUIT,
-            OBJ_ONLINE => {
-                result = RESULT_QUIT;
-                ctx.globals.open_url = true;
-            }
+            OBJ_ONLINE => ctx.host.open_url(ONLINE_URL),
             _ => {}
         }
         if self.capn_sequence != SEQ_NONE {

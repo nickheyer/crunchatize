@@ -21,6 +21,9 @@ const LOADING_Y: i32 = 0xd6;
 // Opened when the player picks Go Online, the source and credits for this port
 pub const ONLINE_URL: &str = "https://github.com/nickheyer/crunchatize";
 
+// Opened by the Buy me a coffee button on the save picker
+pub const COFFEE_URL: &str = "https://buymeacoffee.com/nickheyer";
+
 // One of the nine concrete screens, dispatched by game state id
 pub enum ScreenBox {
     Title(TitleScreen),
@@ -167,7 +170,7 @@ fn draw_debug_overlay<H: Host>(ctx: &mut Ctx<H>, delta_ms: i32) {
     ctx.av.display.gdi_text(0, 0x20, &sound);
 }
 
-// Runs the whole game from boot to quit, performs the exit actions, and hands the host back
+// Runs the whole game from boot to quit, saves the loaded player, and hands the host back
 pub async fn run<H: Host>(host: H, out_rate: u32) -> H {
     let mut ctx = Ctx::new(host, out_rate);
     let seed = ctx.host.unix_time();
@@ -205,11 +208,6 @@ pub async fn run<H: Host>(host: H, out_rate: u32) -> H {
         let mut name = ctx.globals.save_name.clone();
         save_player(&mut ctx.host, &ctx.player, &mut name);
         ctx.globals.save_name = name;
-    }
-    if ctx.globals.launch_setup {
-        ctx.host.launch_setup();
-    } else if ctx.globals.open_url {
-        ctx.host.open_url(ONLINE_URL);
     }
     ctx.host
 }

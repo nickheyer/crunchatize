@@ -261,10 +261,6 @@ impl Host for WebHost {
         true
     }
 
-    fn launch_setup(&mut self) {
-        web_sys::console::log_1(&"Setup.exe launch requested".into());
-    }
-
     fn log(&mut self, message: &str) {
         web_sys::console::log_1(&message.into());
     }

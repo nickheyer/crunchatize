@@ -679,8 +679,6 @@ mod tests {
             false
         }
 
-        fn launch_setup(&mut self) {}
-
         fn log(&mut self, _message: &str) {}
     }
 

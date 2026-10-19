@@ -447,7 +447,7 @@ impl ActorManager {
             if vy < 25.0 {
                 vy = 25.0;
             }
-            if plat[0] <= me[2] - 15 && me[0] + 15 <= plat[2] && (plat[1] as f32) < me[3] as f32 + vy {
+            if plat[0] <= me[2] - 15 && me[0] + 15 <= plat[2] && (me[3] as f32) < plat[1] as f32 + vy {
                 let (px, py) = (self.actors[i].x, self.actors[i].y);
                 let flags = self.actors[i].flags;
                 let a = self.get_mut(id);

@@ -18,6 +18,15 @@ pub const fn rgb_to_565(rgb: [u8; 3]) -> u16 {
     ((rgb[0] as u16 >> 3) << 11) | ((rgb[1] as u16 >> 2) << 5) | (rgb[2] as u16 >> 3)
 }
 
+// Mean of 5-6-5 pixels, channel by channel
+pub fn average_565(pixels: &[u16]) -> u16 {
+    let n = pixels.len() as u32;
+    let r = pixels.iter().map(|&p| u32::from(p >> 11)).sum::<u32>() / n;
+    let g = pixels.iter().map(|&p| u32::from((p >> 5) & 0x3f)).sum::<u32>() / n;
+    let b = pixels.iter().map(|&p| u32::from(p & 0x1f)).sum::<u32>() / n;
+    ((r << 11) | (g << 5) | b) as u16
+}
+
 // Converts a 0x00RRGGBB key color into the surface pixel value it keys on
 pub const fn color_key_565(color: u32) -> u16 {
     rgb_to_565([(color >> 16) as u8, (color >> 8) as u8, color as u8])
@@ -63,6 +72,17 @@ impl Texture {
             pixels,
             key: None,
             source,
+        }
+    }
+
+    pub fn pixel(&self, x: i32, y: i32) -> u16 {
+        self.pixels[y as usize * self.width as usize + x as usize]
+    }
+
+    // Writes a pixel, ignoring coordinates outside the texture
+    pub fn put(&mut self, x: i32, y: i32, value: u16) {
+        if 0 <= x && x < i32::from(self.width) && 0 <= y && y < i32::from(self.height) {
+            self.pixels[y as usize * self.width as usize + x as usize] = value;
         }
     }
 
@@ -148,6 +168,12 @@ impl BitmapManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn average_565_blends_each_channel() {
+        assert_eq!(average_565(&[rgb_to_565([255, 0, 0]), rgb_to_565([0, 0, 255])]), rgb_to_565([120, 0, 120]));
+        assert_eq!(average_565(&[0x1234]), 0x1234);
+    }
 
     #[test]
     fn green_key_matches_palette_entry() {

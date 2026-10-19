@@ -41,8 +41,6 @@ pub const MOUSE_LEFT: usize = 0;
 pub struct Globals {
     pub player_loaded: bool,
     pub save_name: String,
-    pub launch_setup: bool,
-    pub open_url: bool,
     pub debug_overlay: bool,
 }
 

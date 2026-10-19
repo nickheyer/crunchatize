@@ -274,6 +274,11 @@ impl AnimManager {
         display.blit(tex, &dest, clip, tex.key.is_some());
     }
 
+    // Texture id of one frame of an animation
+    pub fn frame_bitmap(&self, handle: u16, frame: usize) -> u16 {
+        self.slots[handle as usize].frames[frame].bitmap
+    }
+
     // Replaces the palette of every retained frame texture of an animation
     pub fn set_palette(&self, handle: u16, palette: &Palette24, bitmaps: &mut BitmapManager) {
         for f in &self.slots[handle as usize].frames {
