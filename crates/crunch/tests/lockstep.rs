@@ -17,6 +17,7 @@ use crunch::online::session::CLOSE_HOST_LEFT;
 use crunch::online::wire::{self, Message};
 use crunch::online::{Notice, Phase};
 use crunch::player::PlayerData;
+use crunch::scene::HOVER_PRESSED;
 use crunch::skin::GUEST_PREFIX;
 
 const DATA_DIR: &str = "/home/nick/code/crunchatize/dev/disc/iso/CrunchData";
@@ -36,6 +37,7 @@ const SCAN_RIGHT: usize = 0xcd;
 const SCAN_ESC: usize = 1;
 const ACTOR_CRUNCHLING: i32 = 0;
 const ACTOR_GUEST: i32 = 7;
+const OBJ_CHALLENGE: i32 = 8;
 
 fn block_on<F: Future>(fut: F) -> F::Output {
     let mut fut = pin!(fut);
@@ -351,6 +353,80 @@ fn object_centre(host: &Player, name: &str) -> (i16, i16) {
     (((o.bbox_x1 + o.bbox_x2) / 2) as i16, ((o.bbox_y1 + o.bbox_y2) / 2) as i16)
 }
 
+
+// Opens a room from the host's home and brings the joiner's crunchling into it through the Go Online box
+fn connect(host: &mut Player, joiner: &mut Player) {
+    steps(host, joiner, 5);
+    click(host, joiner, Side::Host, ONLINE_BUTTON);
+    assert!(host.runner.game.dialog.is_some(), "the Go Online box did not open for the host");
+    click(host, joiner, Side::Host, HOST_PILL);
+    steps(host, joiner, 2);
+    assert_eq!(host.phase(), Phase::HostWaiting { code: CODE.into() });
+    assert_eq!(host.runner.game.dialog.as_ref().map(|d| d.page()), Some(Page::Host));
+    click(host, joiner, Side::Joiner, ONLINE_BUTTON);
+    click(host, joiner, Side::Joiner, JOIN_PILL);
+    for key in [SCAN_T, SCAN_E, SCAN_S, SCAN_T] {
+        tap(host, joiner, Side::Joiner, key);
+    }
+    assert_eq!(joiner.runner.game.dialog.as_ref().map(|d| d.entry()), Some(CODE));
+    tap(host, joiner, Side::Joiner, SCAN_RETURN);
+    steps(host, joiner, 6);
+    assert_eq!(host.phase(), Phase::HostPlaying { code: CODE.into() });
+    assert_eq!(joiner.phase(), Phase::JoinPlaying { code: CODE.into() });
+    assert!(host.runner.game.dialog.is_none() && joiner.runner.game.dialog.is_none(), "the box stayed open");
+    assert_eq!(joiner.runner.ctx.player.name_str(), "CAPN", "the joiner is not simulating the host's world");
+    for p in [&*host, &*joiner] {
+        assert_eq!(p.runner.ctx.session.guest().map(PlayerData::name_str), Some("MATE".into()), "no guest crunchling");
+        assert!(p.runner.ctx.actors.find(ACTOR_GUEST).is_some(), "the friend's crunchling is not in the home world");
+    }
+    assert_eq!(host.runner.ctx.session.epoch(), joiner.runner.ctx.session.epoch());
+    assert!(wait_for_hands(host, joiner), "the home world never gave the hands out");
+    host.point((600, 400), false);
+    joiner.point((600, 420), false);
+    steps(host, joiner, 2);
+}
+
+// Runs frames until the home world shows the hands again, false when it never does
+fn wait_for_hands(host: &mut Player, joiner: &mut Player) -> bool {
+    for _ in 0..900 {
+        if host.runner.game.state == STATE_HOME_WORLD && host.runner.ctx.cursor.visible {
+            return true;
+        }
+        step(host, joiner);
+    }
+    false
+}
+
+// Both crunchlings' own skins are loaded and the friend's keys move the friend's crunchling in a game
+fn check_match(host: &mut Player, joiner: &mut Player, game: u32) {
+    assert_eq!(game, joiner.runner.game.state);
+    let (suffix, guest_actor, adult_as_type0) = match game {
+        STATE_RUNNING => ("skating", 1, true),
+        STATE_JUMPING => ("stance", 0, false),
+        _ => ("throw_stance", 1, false),
+    };
+    let guest = host.runner.ctx.session.guest().cloned().expect("guest record");
+    let key = format!("{GUEST_PREFIX}{}", guest.anim_name(suffix, false, adult_as_type0));
+    for p in [&*host, &*joiner] {
+        assert!(p.runner.ctx.av.anims.find(&key).is_some(), "the opponent is not wearing the friend's crunchling: {key}");
+    }
+    let (guest_start, _) = host.runner.ctx.actors.pos(guest_actor);
+    joiner.keys(&[SCAN_RIGHT]);
+    let mut moved = false;
+    for _ in 0..900 {
+        step(host, joiner);
+        if host.runner.ctx.actors.pos(guest_actor).0 > guest_start + 30.0 {
+            moved = true;
+            break;
+        }
+    }
+    assert!(moved, "the friend's right key did not move the friend's crunchling in state {game:#x}");
+    joiner.keys(&[]);
+    steps(host, joiner, 10);
+    assert_eq!(host.hash(), joiner.hash(), "the worlds drifted apart in the match");
+    assert_eq!(joiner.runner.ctx.session.desyncs(), 0);
+}
+
 #[test]
 fn host_and_helper_stay_in_lockstep() {
     if !Path::new(DATA_DIR).is_dir() {
@@ -359,34 +435,7 @@ fn host_and_helper_stay_in_lockstep() {
     let link = Rc::new(RefCell::new(Link::default()));
     let mut host = Player::new(Side::Host, &link, player("CAPN", 0, 0));
     let mut joiner = Player::new(Side::Joiner, &link, player("MATE", 1, 2));
-    steps(&mut host, &mut joiner, 5);
-
-    // The host opens the box and starts a room
-    click(&mut host, &mut joiner, Side::Host, ONLINE_BUTTON);
-    assert!(host.runner.game.dialog.is_some(), "the Go Online box did not open for the host");
-    click(&mut host, &mut joiner, Side::Host, HOST_PILL);
-    steps(&mut host, &mut joiner, 2);
-    assert_eq!(host.phase(), Phase::HostWaiting { code: CODE.into() });
-    assert_eq!(host.runner.game.dialog.as_ref().map(|d| d.page()), Some(Page::Host));
-
-    // The joiner types the code
-    click(&mut host, &mut joiner, Side::Joiner, ONLINE_BUTTON);
-    click(&mut host, &mut joiner, Side::Joiner, JOIN_PILL);
-    for key in [SCAN_T, SCAN_E, SCAN_S, SCAN_T] {
-        tap(&mut host, &mut joiner, Side::Joiner, key);
-    }
-    assert_eq!(joiner.runner.game.dialog.as_ref().map(|d| d.entry()), Some(CODE));
-    tap(&mut host, &mut joiner, Side::Joiner, SCAN_RETURN);
-    steps(&mut host, &mut joiner, 6);
-    assert_eq!(host.phase(), Phase::HostPlaying { code: CODE.into() });
-    assert_eq!(joiner.phase(), Phase::JoinPlaying { code: CODE.into() });
-    assert!(host.runner.game.dialog.is_none() && joiner.runner.game.dialog.is_none(), "the box stayed open");
-    assert_eq!(joiner.runner.ctx.player.name_str(), "CAPN", "the joiner is not simulating the host's world");
-    for p in [&host, &joiner] {
-        assert_eq!(p.runner.ctx.session.guest().map(PlayerData::name_str), Some("MATE".into()), "no guest crunchling");
-        assert!(p.runner.ctx.actors.find(ACTOR_GUEST).is_some(), "the friend's crunchling is not in the home world");
-    }
-    assert_eq!(host.runner.ctx.session.epoch(), joiner.runner.ctx.session.epoch());
+    connect(&mut host, &mut joiner);
 
     // Both hands wander for a while
     for i in 0..90i16 {
@@ -411,6 +460,26 @@ fn host_and_helper_stay_in_lockstep() {
     steps(&mut host, &mut joiner, 30);
     assert_eq!(host.hash(), joiner.hash(), "the worlds drifted apart after the praise");
 
+    // The friend pulls a lever and only the friend's crunchling eats, then the host feeds its own
+    let guest_food = |p: &Player| p.runner.ctx.session.guest().map_or(0, |g| g.food);
+    let host_food = |p: &Player| p.runner.ctx.player.food;
+    let (host_before, guest_before) = (host_food(&host), guest_food(&host));
+    let lever = object_centre(&host, "k1");
+    click(&mut host, &mut joiner, Side::Joiner, lever);
+    assert!(wait_for_hands(&mut host, &mut joiner), "the friend's feeding never finished");
+    assert_eq!(guest_food(&host), guest_before + 1, "the lever the friend pulled did not feed the friend's crunchling");
+    assert_eq!(host_food(&host), host_before, "the lever the friend pulled fed the host's crunchling");
+    assert_eq!(guest_food(&joiner), guest_before + 1, "the friend's food differs between the machines");
+    joiner.point((600, 420), false);
+    let lever = object_centre(&host, "k2");
+    click(&mut host, &mut joiner, Side::Host, lever);
+    assert!(wait_for_hands(&mut host, &mut joiner), "the host's feeding never finished");
+    assert_eq!(host_food(&host), host_before + 1, "the lever the host pulled did not feed the host's crunchling");
+    assert_eq!(guest_food(&host), guest_before + 1, "the lever the host pulled fed the friend's crunchling");
+    host.point((600, 400), false);
+    steps(&mut host, &mut joiner, 10);
+    assert_eq!(host.hash(), joiner.hash(), "the worlds drifted apart after feeding");
+
     // The host asks the caster for a tip and the helper's space key skips the speech
     let tips = object_centre(&host, "tips");
     click(&mut host, &mut joiner, Side::Host, tips);
@@ -427,82 +496,70 @@ fn host_and_helper_stay_in_lockstep() {
     joiner.keys(&[SCAN_SPACE]);
     steps(&mut host, &mut joiner, 4);
     joiner.keys(&[]);
-    let mut cursor_back = false;
-    for _ in 0..200 {
-        step(&mut host, &mut joiner);
-        if host.runner.ctx.cursor.visible {
-            cursor_back = true;
-            break;
-        }
-    }
-    assert!(cursor_back, "the helper's space key did not end the speech");
+    assert!(wait_for_hands(&mut host, &mut joiner), "the helper's space key did not end the speech");
     steps(&mut host, &mut joiner, 60);
     assert_eq!(host.hash(), joiner.hash(), "the worlds drifted apart after the speech");
     assert_eq!(joiner.runner.ctx.session.desyncs(), 0);
     assert!(!host.runner.ctx.host.log.iter().any(|l| l.contains("lost sync")), "{:?}", host.runner.ctx.host.log);
 
-    // The friend picks challenges from the host's home until every game has pitted the two crunchlings
-    let games = [STATE_RUNNING, STATE_JUMPING, STATE_THROWING];
-    let mut seen: Vec<u32> = Vec::new();
-    for _ in 0..12 {
-        if seen.len() == games.len() {
-            break;
-        }
-        let door = object_centre(&host, "challenge");
-        click(&mut host, &mut joiner, Side::Joiner, door);
-        assert!(wait_for_state(&mut host, &mut joiner, &[STATE_CHALLENGE], 1500), "the friend's click did not start a challenge");
-        assert_eq!(host.runner.game.state, joiner.runner.game.state);
-        steps(&mut host, &mut joiner, 20);
-        host.keys(&[SCAN_SPACE]);
-        assert!(wait_for_state(&mut host, &mut joiner, &games, 600), "the challenge never reached a game");
-        host.keys(&[]);
-        let game = host.runner.game.state;
-        assert_eq!(game, joiner.runner.game.state);
-        let (suffix, guest_actor, adult_as_type0) = match game {
-            STATE_RUNNING => ("skating", 1, true),
-            STATE_JUMPING => ("stance", 0, false),
-            _ => ("throw_stance", 1, false),
-        };
-        let guest = host.runner.ctx.session.guest().cloned().expect("guest record");
-        let key = format!("{GUEST_PREFIX}{}", guest.anim_name(suffix, false, adult_as_type0));
-        for p in [&host, &joiner] {
-            assert!(p.runner.ctx.av.anims.find(&key).is_some(), "the opponent is not wearing the friend's crunchling: {key}");
-        }
+    // The thief's door stays locked for a baby host even with a friend in the world
+    let door = object_centre(&host, "challenge");
+    let locked = host.runner.ctx.scene.objects.iter().find(|o| o.id == OBJ_CHALLENGE).map(|o| o.hover);
+    assert_eq!(locked, Some(HOVER_PRESSED), "the thief's door is not drawn locked");
+    click(&mut host, &mut joiner, Side::Joiner, door);
+    click(&mut host, &mut joiner, Side::Host, door);
+    steps(&mut host, &mut joiner, 200);
+    assert_eq!(host.runner.game.state, STATE_HOME_WORLD, "a locked thief door opened in a friend's session");
+    assert!(host.runner.ctx.cursor.visible, "a locked thief door started a sequence");
 
-        // The friend's own keys move the friend's crunchling once the countdown ends
-        let (guest_start, _) = host.runner.ctx.actors.pos(guest_actor);
-        joiner.keys(&[SCAN_RIGHT]);
-        let mut moved = false;
-        for _ in 0..900 {
-            step(&mut host, &mut joiner);
-            if host.runner.ctx.actors.pos(guest_actor).0 > guest_start + 30.0 {
-                moved = true;
-                break;
-            }
-        }
-        assert!(moved, "the friend's right key did not move the friend's crunchling in state {game:#x}");
-        joiner.keys(&[]);
-        steps(&mut host, &mut joiner, 10);
-        assert_eq!(host.hash(), joiner.hash(), "the worlds drifted apart in the match");
-        assert_eq!(joiner.runner.ctx.session.desyncs(), 0);
-        if !seen.contains(&game) {
-            seen.push(game);
+    // The friend picks every training door and each game pits the two crunchlings against each other
+    for (name, game) in [("speed", STATE_RUNNING), ("jump", STATE_JUMPING), ("strength", STATE_THROWING)] {
+        host.point((600, 400), false);
+        joiner.point((600, 420), false);
+        let door = object_centre(&host, name);
+        click(&mut host, &mut joiner, Side::Joiner, door);
+        assert!(wait_for_state(&mut host, &mut joiner, &[game], 1500), "the {name} door did not start its game");
+        assert_eq!(host.runner.ctx.player.challenge_active, 0, "a training door started a challenge");
+        check_match(&mut host, &mut joiner, game);
+        if game == STATE_RUNNING {
+            assert!(host.runner.ctx.av.anims.find("turtle_running").is_none(), "the turtle came to a friend race");
         }
         tap(&mut host, &mut joiner, Side::Host, SCAN_ESC);
         assert!(wait_for_state(&mut host, &mut joiner, &[STATE_HOME_WORLD], 60), "escape did not bring both home");
         assert!(host.runner.ctx.actors.find(ACTOR_GUEST).is_some(), "the friend's crunchling did not come home");
-        let mut settled = false;
-        for _ in 0..600 {
-            step(&mut host, &mut joiner);
-            if host.runner.ctx.cursor.visible {
-                settled = true;
-                break;
-            }
-        }
-        assert!(settled, "the home world never gave the hands back");
+        assert!(wait_for_hands(&mut host, &mut joiner), "the home world never gave the hands back");
     }
-    assert_eq!(seen.len(), games.len(), "only these games were drawn in twelve challenges {seen:?}");
     assert_eq!(host.hash(), joiner.hash(), "the worlds drifted apart back home");
+
+    // A race run to its end pays both crunchlings when the friend's hand presses done
+    let (host_running, guest_running) = (host.runner.ctx.player.running, host.runner.ctx.session.guest().unwrap().running);
+    let (host_before, guest_before) = (host_food(&host), guest_food(&host));
+    let door = object_centre(&host, "speed");
+    click(&mut host, &mut joiner, Side::Joiner, door);
+    assert!(wait_for_state(&mut host, &mut joiner, &[STATE_RUNNING], 1500), "the speed door did not start the race");
+    host.keys(&[SCAN_RIGHT]);
+    let mut decided = false;
+    for _ in 0..3000 {
+        step(&mut host, &mut joiner);
+        if host.runner.ctx.cursor.visible {
+            decided = true;
+            break;
+        }
+    }
+    host.keys(&[]);
+    assert!(decided, "the friend race never ended");
+    assert_eq!(host.hash(), joiner.hash(), "the worlds drifted apart at the finish");
+    let banner = host.runner.ctx.scene.text_by_id(7);
+    assert_eq!(banner.as_deref(), Some("CAPN WINS!"), "the banner does not name the winner");
+    let done = object_centre(&host, "done");
+    click(&mut host, &mut joiner, Side::Joiner, done);
+    assert!(wait_for_state(&mut host, &mut joiner, &[STATE_HOME_WORLD], 60), "the friend's done click did not go home");
+    assert_eq!(host.runner.ctx.player.running, host_running + 1, "the host was not paid for the race");
+    assert_eq!(host.runner.ctx.session.guest().unwrap().running, guest_running + 1, "the friend was not paid for the race");
+    assert_eq!((host_food(&host), guest_food(&host)), (host_before - 1, guest_before - 1), "the race did not cost food");
+    assert!(wait_for_hands(&mut host, &mut joiner), "the home world never gave the hands back after the race");
+    assert_eq!(host.hash(), joiner.hash(), "the worlds drifted apart after the race");
+    assert_eq!(joiner.runner.ctx.session.desyncs(), 0);
 
     // The host quits, the helper returns to their own crunchling with the box explaining why
     host.point(QUIT_BUTTON, false);
@@ -524,11 +581,43 @@ fn host_and_helper_stay_in_lockstep() {
     }
     assert_eq!(joiner.phase(), Phase::Offline);
     assert_eq!(joiner.runner.ctx.player.name_str(), "MATE", "the helper did not get their own crunchling back");
-    assert_eq!(joiner.runner.ctx.player.happiness, praised_guest, "the praise did not travel home with the crunchling");
+    assert_eq!(joiner.runner.ctx.player.happiness, praised_guest - 1, "the praise less the race's cost did not travel home");
+    assert_eq!(joiner.runner.ctx.player.running, guest_running + 1, "the training did not travel home with the crunchling");
     assert!(joiner.runner.ctx.session.guest().is_none());
     assert_eq!(joiner.runner.ctx.globals.save_name, "joiner.crn");
     assert_eq!(joiner.runner.ctx.session.notice(), Notice::HostLeft);
     assert_eq!(joiner.runner.game.dialog.as_ref().map(|d| d.page()), Some(Page::Join));
     let saved_joiner = joiner.runner.finish();
     assert!(saved_joiner.saves.iter().any(|(n, d)| n == "joiner.crn" && d.windows(4).any(|w| w == b"MATE")));
+}
+
+// An adult host's thief door opens the challenge dialogue and a match in the thief's arena against the friend
+#[test]
+fn adult_host_takes_a_friend_into_the_thief_arena() {
+    if !Path::new(DATA_DIR).is_dir() {
+        return;
+    }
+    let link = Rc::new(RefCell::new(Link::default()));
+    let mut host = Player::new(Side::Host, &link, player("CAPN", 2, 1));
+    let mut joiner = Player::new(Side::Joiner, &link, player("MATE", 0, 0));
+    connect(&mut host, &mut joiner);
+    let games = [STATE_RUNNING, STATE_JUMPING, STATE_THROWING];
+    let door = object_centre(&host, "challenge");
+    click(&mut host, &mut joiner, Side::Joiner, door);
+    assert!(wait_for_state(&mut host, &mut joiner, &[STATE_CHALLENGE], 1500), "the thief door did not open for an adult");
+    assert_eq!(host.runner.game.state, joiner.runner.game.state);
+    steps(&mut host, &mut joiner, 20);
+    joiner.keys(&[SCAN_SPACE]);
+    assert!(wait_for_state(&mut host, &mut joiner, &games, 600), "the challenge never reached a game");
+    joiner.keys(&[]);
+    assert_eq!(host.runner.ctx.player.challenge_active, 1, "the thief door did not start a challenge");
+    let game = host.runner.game.state;
+    check_match(&mut host, &mut joiner, game);
+    tap(&mut host, &mut joiner, Side::Host, SCAN_ESC);
+    assert!(wait_for_state(&mut host, &mut joiner, &[STATE_HOME_WORLD], 60), "escape did not bring both home");
+    assert!(host.runner.ctx.actors.find(ACTOR_GUEST).is_some(), "the friend's crunchling did not come home");
+    assert!(wait_for_hands(&mut host, &mut joiner), "the home world never gave the hands back");
+    assert_eq!(host.runner.ctx.player.challenge_active, 0);
+    assert_eq!(host.hash(), joiner.hash(), "the worlds drifted apart back home");
+    assert_eq!(joiner.runner.ctx.session.desyncs(), 0);
 }

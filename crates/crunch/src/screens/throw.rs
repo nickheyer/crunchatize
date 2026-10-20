@@ -4,12 +4,11 @@ use crate::actors::{
     EVENT_ANIM_END, EVENT_GROUND_REACHED, EVENT_INIT_OBJECT, EVENT_TARGET_REACHED, EVENT_TIMER, FACING_NONE, NO_TARGET,
 };
 use crate::ctx::{
-    Ctx, Held, KEY_ESC, KEY_SPACE, MOUSE_LEFT, RESULT_CONTINUE, STATE_CHALLENGE, STATE_HOME_WORLD, STATE_THROWING,
-    Screen,
+    Ctx, Held, KEY_ESC, KEY_SPACE, RESULT_CONTINUE, STATE_CHALLENGE, STATE_HOME_WORLD, STATE_THROWING, Screen,
 };
 use crate::host::Host;
-use crate::online::wins_text;
-use crate::player::PlayerData;
+use crate::online::{tie_text, wins_text};
+use crate::player::{PlayerData, STAT_STRENGTH};
 use crate::scene::{HOVER_HIDDEN, HOVER_NORMAL};
 use crate::skin::Skin;
 
@@ -73,6 +72,12 @@ const OBJ_TIME_TEXT: i32 = 4;
 const OBJ_DONE: i32 = 5;
 const OBJ_GOOD_JOB: i32 = 6;
 const OBJ_AGAIN: i32 = 7;
+const OBJ_GUEST_SCORE: i32 = 8;
+const OBJ_GUEST_TEXT: i32 = 9;
+
+// Friend match score on the lava field, the friend's name and count mirrored across the clock
+const GUEST_TEXT_AT: (i32, i32) = (400, 7);
+const GUEST_SCORE_AT: (i32, i32) = (453, 41);
 
 const ROCK_SLOTS: usize = 4;
 const LAVA_SLOTS: usize = 4;
@@ -101,6 +106,7 @@ const PHASE_CHALLENGE_COUNTDOWN: i32 = 3;
 
 const OUTCOME_WIN: i32 = 1;
 const OUTCOME_LOSE: i32 = 2;
+const OUTCOME_TIE: i32 = 3;
 
 const COUNTDOWN_START: u32 = 0x83;
 const COUNTDOWN_THREE: u32 = 0x82;
@@ -221,9 +227,24 @@ fn set_actor_anim<H: Host>(ctx: &mut Ctx<H>, id: i32, anim: u16, notify: bool, m
     ctx.actors.set_anims(&ctx.av, id, anim, anim, notify, mode);
 }
 
-// Who won a friend match at the first score of ten, the resident crunchling only with the higher score
+// Who won a match, the resident crunchling with the higher score, level scores a tie
 fn match_outcome(score: u32, rival_score: u32) -> i32 {
-    if score > rival_score { OUTCOME_WIN } else { OUTCOME_LOSE }
+    if score > rival_score {
+        OUTCOME_WIN
+    } else if score < rival_score {
+        OUTCOME_LOSE
+    } else {
+        OUTCOME_TIE
+    }
+}
+
+// Banner naming the winner of a friend match
+fn versus_banner(outcome: i32, resident: &str, guest: &str) -> String {
+    match outcome {
+        OUTCOME_WIN => wins_text(resident),
+        OUTCOME_LOSE => wins_text(guest),
+        _ => tie_text().to_string(),
+    }
 }
 
 impl ThrowScreen {
@@ -248,8 +269,9 @@ impl ThrowScreen {
     // Loads the WAM, sounds, actors and animations, false when any asset is missing
     async fn init_screen<H: Host>(&mut self, ctx: &mut Ctx<H>) -> bool {
         self.challenge_phase = ctx.player.challenge_active as i32;
-        self.intro_active = self.challenge_phase == PHASE_NORMAL;
-        let guest = ctx.session.guest().filter(|_| self.challenge_phase != PHASE_NORMAL).cloned();
+        let guest = ctx.session.guest().cloned();
+        let untrained = ctx.player.strength <= 0 || guest.as_ref().is_some_and(|g| g.strength <= 0);
+        self.intro_active = self.challenge_phase == PHASE_NORMAL && untrained;
         if self.challenge_phase == PHASE_NORMAL {
             ctx.scene.load(&mut ctx.av, &mut ctx.host, "throw").await;
             ctx.scene.assign_id("time", OBJ_TIME);
@@ -259,6 +281,16 @@ impl ThrowScreen {
             ctx.scene.set_text_by_id(OBJ_TIME, "60");
             ctx.scene.assign_id("Again", OBJ_AGAIN);
             ctx.scene.set_hover_by_id(OBJ_AGAIN, HOVER_HIDDEN);
+            if let Some(g) = &guest {
+                ctx.scene.assign_id("scoreText", OBJ_SCORE_TEXT);
+                ctx.scene.assign_id("score", OBJ_SCORE);
+                let name = ctx.player.name_str();
+                ctx.scene.set_text_by_id(OBJ_SCORE_TEXT, &name);
+                ctx.scene.clone_object(&ctx.av, OBJ_SCORE_TEXT, OBJ_GUEST_TEXT, GUEST_TEXT_AT.0, GUEST_TEXT_AT.1, 0);
+                ctx.scene.clone_object(&ctx.av, OBJ_SCORE, OBJ_GUEST_SCORE, GUEST_SCORE_AT.0, GUEST_SCORE_AT.1, 1);
+                ctx.scene.set_text_by_id(OBJ_GUEST_TEXT, &g.name_str());
+                ctx.scene.set_text_by_id(OBJ_GUEST_SCORE, "0");
+            }
         } else {
             ctx.scene.load(&mut ctx.av, &mut ctx.host, "throw_challenge").await;
             ctx.scene.assign_id("time", OBJ_TIME);
@@ -303,10 +335,12 @@ impl ThrowScreen {
         for id in [ACTOR_ERUPT_LEFT, ACTOR_ERUPT_RIGHT, 6, 7, 8, 9, ACTOR_PTERO, ACTOR_CAPN] {
             ctx.actors.add_actor(id, true);
         }
+        if self.challenge_phase != PHASE_NORMAL || guest.is_some() {
+            ctx.actors.add_actor(ACTOR_RIVAL, true);
+        }
         if self.challenge_phase == PHASE_NORMAL {
             self.music = ctx.av.play_stream_sound(&mut ctx.host, "tg56Throwing.wav", true, 0).await;
         } else {
-            ctx.actors.add_actor(ACTOR_RIVAL, true);
             self.music = ctx.av.play_stream_sound(&mut ctx.host, "tg57Challenge.wav", true, 0).await;
         }
         for id in [ACTOR_JURICAR, ACTOR_LIGHTNING, ACTOR_PLAYER, 2, 3, 4, 5, ACTOR_COUNTDOWN] {
@@ -390,9 +424,6 @@ impl ThrowScreen {
         self.ptero_x = 0.0;
         self.exit_frames = 0;
         self.commentary_counter = 0;
-        if ctx.player.strength > 0 {
-            self.intro_active = false;
-        }
         true
     }
 
@@ -401,17 +432,19 @@ impl ThrowScreen {
         self.guest.is_some()
     }
 
+    // Text object showing the rival's score, the friend's own counter on the lava field or the thief's slot
+    fn rival_counter(&self) -> i32 {
+        if self.challenge_phase == PHASE_NORMAL { OBJ_GUEST_SCORE } else { OBJ_TIME }
+    }
+
     // Runs one frame of input, motion, scoring and drawing and returns the next state
     async fn update_screen<H: Host>(&mut self, ctx: &mut Ctx<H>) -> u32 {
         let mut ret = RESULT_CONTINUE;
         if ctx.cursor.visible {
             let (dx, dy) = ctx.av.get_mouse_delta();
             ctx.cursor.move_by(dx, dy);
-            let (mx, my) = (ctx.cursor.x, ctx.cursor.y);
-            if let Some(id) = ctx.scene.hit_test(mx as i32, my as i32)
-                && ctx.av.is_mouse_button_down(MOUSE_LEFT)
-            {
-                ret = Self::on_scene_click(&mut ctx.player, id);
+            if let Some(id) = ctx.pressed_object() {
+                ret = Self::on_scene_click(ctx, id);
             }
         }
         ctx.actors.update(&ctx.av);
@@ -535,7 +568,7 @@ impl ThrowScreen {
                 ctx.actors.set_visible(ACTOR_CAPN, true);
                 self.capn_state = CAPN_TV_TALKING;
             }
-        } else if ctx.av.is_key_down(KEY_SPACE) {
+        } else if ctx.either_key_down(KEY_SPACE) {
             ctx.av.kill_streaming_channel(self.voice);
             ctx.actors.walk_to(&ctx.av, ACTOR_CAPN, NO_TARGET);
             ctx.actors.set_visible(ACTOR_JURICAR, false);
@@ -615,9 +648,9 @@ impl ThrowScreen {
                 }
             }
         }
-        if self.challenge_phase != PHASE_NORMAL && old_rival_score != self.rival_score {
+        if (self.challenge_phase != PHASE_NORMAL || self.versus()) && old_rival_score != self.rival_score {
             let text = format!("{}", self.rival_score);
-            ctx.scene.set_text_by_id(OBJ_TIME, &text);
+            ctx.scene.set_text_by_id(self.rival_counter(), &text);
         }
         ctx.actors.draw(&mut ctx.av, &ctx.scene, LAYER_MAIN);
         ctx.actors.draw(&mut ctx.av, &ctx.scene, LAYER_CAPN);
@@ -625,7 +658,7 @@ impl ThrowScreen {
         ctx.scene.draw_layer(&mut ctx.av, 1);
         ctx.cursor.draw(&mut ctx.av);
         ctx.scene.advance_anims(&ctx.av);
-        if ctx.av.is_key_down(KEY_ESC) {
+        if ctx.either_key_down(KEY_ESC) {
             ret = STATE_HOME_WORLD;
         }
         if self.challenge_phase != PHASE_NORMAL && self.player.state == PS_GAME_OVER {
@@ -700,7 +733,24 @@ impl ThrowScreen {
             set_actor_anim(ctx, ACTOR_RIVAL, self.anims[A_THIEF_STANCE], false, STATE_RESTART_FORWARD);
         }
         self.player.state = PS_GAME_OVER;
-        if self.challenge_phase == PHASE_NORMAL {
+        if self.versus() {
+            let banner = versus_banner(self.outcome, &ctx.player.name_str(), &ctx.session.guest_name());
+            ctx.scene.set_text_by_id(OBJ_GOOD_JOB, &banner);
+            ctx.scene.set_hover_by_id(OBJ_GOOD_JOB, HOVER_NORMAL);
+            if self.challenge_phase == PHASE_NORMAL {
+                if ctx.player.throw_high_score < self.score {
+                    ctx.player.throw_high_score = self.score;
+                }
+                if let Some(guest) = ctx.session.guest_mut()
+                    && guest.throw_high_score < self.rival_score
+                {
+                    guest.throw_high_score = self.rival_score;
+                }
+                ctx.scene.set_hover_by_id(OBJ_DONE, HOVER_NORMAL);
+                ctx.scene.set_hover_by_id(OBJ_AGAIN, HOVER_NORMAL);
+                ctx.cursor.set_visible(true);
+            }
+        } else if self.challenge_phase == PHASE_NORMAL {
             let old_high = format!("{}", ctx.player.throw_high_score);
             if ctx.player.throw_high_score < self.score {
                 ctx.player.throw_high_score = self.score;
@@ -714,10 +764,6 @@ impl ThrowScreen {
             ctx.scene.set_hover_by_id(OBJ_GOOD_JOB, HOVER_NORMAL);
             ctx.scene.set_hover_by_id(OBJ_AGAIN, HOVER_NORMAL);
             ctx.cursor.set_visible(true);
-        } else if self.versus() {
-            let winner = if self.outcome == OUTCOME_WIN { ctx.player.name_str() } else { ctx.session.guest_name() };
-            ctx.scene.set_text_by_id(OBJ_GOOD_JOB, &wins_text(&winner));
-            ctx.scene.set_hover_by_id(OBJ_GOOD_JOB, HOVER_NORMAL);
         } else if self.outcome == OUTCOME_WIN {
             ctx.scene.set_hover_by_id(OBJ_GOOD_JOB, HOVER_NORMAL);
         }
@@ -868,23 +914,18 @@ impl ThrowScreen {
         }
     }
 
-    // Done spends food and happiness and trains strength, Again only trains, both leave the screen
-    fn on_scene_click(player: &mut PlayerData, id: i32) -> u32 {
-        let mut ret = RESULT_CONTINUE;
-        if id == OBJ_DONE {
-            if player.food != 0 {
-                player.food = player.food.wrapping_sub(1);
-            }
-            if player.happiness != 0 {
-                player.happiness = player.happiness.wrapping_sub(1);
-            }
-            player.add_stats(0, 1, 0);
-            ret = STATE_HOME_WORLD;
-        } else if id == OBJ_AGAIN {
-            player.add_stats(0, 1, 0);
-            ret = STATE_THROWING;
+    // Done spends food and happiness and trains strength, Again only trains, for every thrower in the match
+    fn on_scene_click<H: Host>(ctx: &mut Ctx<H>, id: i32) -> u32 {
+        let going_home = match id {
+            OBJ_DONE => true,
+            OBJ_AGAIN => false,
+            _ => return RESULT_CONTINUE,
+        };
+        ctx.player.train(STAT_STRENGTH, false, going_home);
+        if let Some(guest) = ctx.session.guest_mut() {
+            guest.train(STAT_STRENGTH, false, going_home);
         }
-        ret
+        if going_home { STATE_HOME_WORLD } else { STATE_THROWING }
     }
 
     // Routes actor events to the init, anim end, timer and ground handlers
@@ -1040,22 +1081,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn done_spends_food_and_happiness_and_trains_strength() {
-        let mut p = PlayerData { food: 3, happiness: 0, ..Default::default() };
-        assert_eq!(ThrowScreen::on_scene_click(&mut p, OBJ_DONE), STATE_HOME_WORLD);
-        assert_eq!((p.food, p.happiness, p.strength), (2, 0, 1));
-    }
-
-    #[test]
-    fn again_trains_strength_and_other_ids_do_nothing() {
-        let mut p = PlayerData::default();
-        assert_eq!(ThrowScreen::on_scene_click(&mut p, OBJ_AGAIN), STATE_THROWING);
-        assert_eq!(p.strength, 1);
-        assert_eq!(ThrowScreen::on_scene_click(&mut p, OBJ_SCORE), RESULT_CONTINUE);
-        assert_eq!(p.strength, 1);
-    }
-
-    #[test]
     fn stage_table_rows_follow_anim_index() {
         let mut p = PlayerData::default();
         let baby = STAGE_TABLE[p.anim_index(false) as usize];
@@ -1084,7 +1109,10 @@ mod tests {
     fn match_goes_to_the_higher_score() {
         assert_eq!(match_outcome(10, 3), OUTCOME_WIN);
         assert_eq!(match_outcome(9, 10), OUTCOME_LOSE);
-        assert_eq!(match_outcome(10, 10), OUTCOME_LOSE);
+        assert_eq!(match_outcome(10, 10), OUTCOME_TIE);
+        assert_eq!(versus_banner(OUTCOME_WIN, "SPAZ", "MATE"), "SPAZ WINS!");
+        assert_eq!(versus_banner(OUTCOME_LOSE, "SPAZ", "MATE"), "MATE WINS!");
+        assert_eq!(versus_banner(OUTCOME_TIE, "SPAZ", "MATE"), "TIE!");
     }
 
     #[test]

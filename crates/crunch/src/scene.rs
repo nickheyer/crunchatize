@@ -325,6 +325,27 @@ impl Scene {
         index
     }
 
+    // Copies an object under a new id to another spot and alignment, false when the id is unknown
+    pub fn clone_object(&mut self, av: &Av, id: i32, new_id: i32, x: i32, y: i32, align: i32) -> bool {
+        let Some(i) = self.index_of_id(id) else { return false };
+        let mut copy = self.objects[i].clone();
+        copy.x = x;
+        copy.y = y;
+        copy.align = align;
+        let index = self.add_object(av, &copy);
+        self.objects[index].id = new_id;
+        true
+    }
+
+    // Moves an object to another spot and refreshes its hit box
+    pub fn move_object(&mut self, av: &Av, id: i32, x: i32, y: i32) {
+        if let Some(i) = self.index_of_id(id) {
+            self.objects[i].x = x;
+            self.objects[i].y = y;
+            self.recalc_bbox(av, i);
+        }
+    }
+
     pub fn get_object(&self, index: usize) -> SceneObject {
         self.objects[index].clone()
     }

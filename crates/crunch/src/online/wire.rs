@@ -2,7 +2,7 @@ use avmanager::input::DeviceState;
 
 use crate::player::{PlayerData, SAVE_SIZE};
 
-pub const PROTOCOL: u8 = 2;
+pub const PROTOCOL: u8 = 3;
 pub const CODE_LEN: usize = 4;
 
 const TAG_HELLO: u8 = 1;

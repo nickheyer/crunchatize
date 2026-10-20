@@ -12,7 +12,6 @@ use crate::ctx::{
     RESULT_CONTINUE, RESULT_QUIT, STATE_CHALLENGE, STATE_HOME_WORLD, STATE_JUMPING, STATE_RUNNING, STATE_THROWING,
     Screen,
 };
-use crate::cursor::Cursor;
 use crate::host::Host;
 use crate::online::Who;
 use crate::player::PlayerData;
@@ -66,7 +65,7 @@ const SEQ_JUMP: u32 = 4;
 const SEQ_STRENGTH: u32 = 5;
 const SEQ_CHALLENGE: u32 = 6;
 
-// States of the visiting friend's crunchling, which wanders, plays and leaves for a challenge
+// States of the visiting friend's crunchling, which wanders, plays, eats and leaves for every game
 const GS_IDLE: u32 = 0;
 const GS_WALK_RIGHT: u32 = 1;
 const GS_WALK_LEFT: u32 = 2;
@@ -76,6 +75,25 @@ const GS_QTIP_EAR_LOOP: u32 = 5;
 const GS_QTIP_DISGUST: u32 = 6;
 const GS_QTIP_THROW: u32 = 7;
 const GS_LEAVING: u32 = 8;
+const GS_RUN_TO_FEEDER: u32 = 9;
+const GS_RUN_TO_PILE: u32 = 10;
+const GS_SPEECH_RUN: u32 = 11;
+
+// The crunchling a pulled lever feeds, the resident one or the visiting friend's
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Eater {
+    Resident,
+    Guest,
+}
+
+impl Eater {
+    fn of(who: Who) -> Self {
+        match who {
+            Who::Primary => Self::Resident,
+            Who::Helper => Self::Guest,
+        }
+    }
+}
 
 // Handle table of the visiting crunchling's own recoloured animations
 const G_BLINK: usize = 0;
@@ -91,7 +109,11 @@ const G_QTIP_OUT: usize = 9;
 const G_QTIP_EAR_LOOP: usize = 10;
 const G_QTIP_DISGUST: usize = 11;
 const G_QTIP_THROW: usize = 12;
-const G_COUNT: usize = 13;
+const G_EAT: usize = 13;
+const G_NO_FOOD: usize = 14;
+const G_HUNGRY: usize = 15;
+const G_NEED_PRAISE: usize = 16;
+const G_COUNT: usize = 17;
 
 // Indices into the anim handle table that lived at DAT_0042bd60 in the original
 const ANIM_BLINK: u16 = 0x00;
@@ -155,6 +177,9 @@ const GUEST_DY: f32 = 10.0;
 const GUEST_START_X: f32 = 200.0;
 const GUEST_WALK_LEFT_X: i32 = 160;
 const GUEST_WALK_RIGHT_X: i32 = 440;
+const GUEST_SPEECH_X: i32 = 340;
+const FEEDER_X: i32 = 400;
+const SPEECH_X: i32 = 300;
 const EXIT_X: i32 = -0x7d;
 const GUEST_EXIT_DELAY: i32 = 0x1e;
 
@@ -220,7 +245,6 @@ pub struct HomeWorldScreen {
     mouse_latched: bool,
     helper_latched: bool,
     helper_cursor_index: u16,
-    helper_cursor: Cursor,
     loop_channel: u32,
     voice_channel: u32,
     last_walk_state: u32,
@@ -260,11 +284,15 @@ pub struct HomeWorldScreen {
     sfx_guest_praise: u16,
     sfx_guest_giggle: u16,
     sfx_guest_qtip: u16,
+    sfx_guest_eat: u16,
+    sfx_guest_hungry: u16,
+    sfx_guest_sad: u16,
     anims: [u16; ANIM_COUNT],
     guest_anims: [u16; G_COUNT],
     guest_state: u32,
     guest_last_walk: u32,
     guest_ear_loops: i32,
+    eater: Eater,
 }
 
 impl Default for HomeWorldScreen {
@@ -279,7 +307,6 @@ impl HomeWorldScreen {
             mouse_latched: false,
             helper_latched: false,
             helper_cursor_index: 0,
-            helper_cursor: Cursor::default(),
             loop_channel: 0,
             voice_channel: 0,
             last_walk_state: 0,
@@ -319,11 +346,15 @@ impl HomeWorldScreen {
             sfx_guest_praise: 0,
             sfx_guest_giggle: 0,
             sfx_guest_qtip: 0,
+            sfx_guest_eat: 0,
+            sfx_guest_hungry: 0,
+            sfx_guest_sad: 0,
             anims: [0; ANIM_COUNT],
             guest_anims: [0; G_COUNT],
             guest_state: GS_IDLE,
             guest_last_walk: GS_WALK_RIGHT,
             guest_ear_loops: 0,
+            eater: Eater::Resident,
         }
     }
 
@@ -557,13 +588,17 @@ impl HomeWorldScreen {
             (G_RUN_RIGHT, "hm_run_right"),
             (G_RUN_LEFT, "hm_run_left"),
             (G_DANCE, "dance"),
+            (G_EAT, "eat"),
+            (G_NO_FOOD, "no_food"),
+            (G_HUNGRY, "hungry"),
+            (G_NEED_PRAISE, "need_praise"),
         ];
-        let praise = match guest.shown_stage() {
+        let voice = match guest.shown_stage() {
             0 => {
                 set.push((G_TICKLE, "tickle"));
                 let Some(h) = Self::load_sfx(ctx, "CS_b_giggle.wav").await else { return false };
                 self.sfx_guest_giggle = h;
-                "CS_b_praise.wav"
+                ["CS_b_praise.wav", "CS_b_eat.wav", "CS_b_hungry.wav", "CS_b_sad.wav"]
             }
             1 => {
                 set.extend([
@@ -574,12 +609,18 @@ impl HomeWorldScreen {
                 ]);
                 let Some(h) = Self::load_sfx(ctx, "cs_qtip.wav").await else { return false };
                 self.sfx_guest_qtip = h;
-                "CS_t_praise.wav"
+                ["CS_t_praise.wav", "CS_t_eat.wav", "CS_t_hungry.wav", "CS_t_sad.wav"]
             }
-            _ => "CS_a_praise.wav",
+            _ => ["CS_a_praise.wav", "CS_a_eat.wav", "CS_a_hungry.wav", "CS_a_sad.wav"],
         };
-        let Some(h) = Self::load_sfx(ctx, praise).await else { return false };
+        let Some(h) = Self::load_sfx(ctx, voice[0]).await else { return false };
         self.sfx_guest_praise = h;
+        let Some(h) = Self::load_sfx(ctx, voice[1]).await else { return false };
+        self.sfx_guest_eat = h;
+        let Some(h) = Self::load_sfx(ctx, voice[2]).await else { return false };
+        self.sfx_guest_hungry = h;
+        let Some(h) = Self::load_sfx(ctx, voice[3]).await else { return false };
+        self.sfx_guest_sad = h;
         for (index, suffix) in set {
             let Some(h) = skin.anim(&mut ctx.av, &mut ctx.host, suffix, false, false, &palette).await else {
                 return false;
@@ -594,13 +635,81 @@ impl HomeWorldScreen {
         ctx.actors.set_anims(&ctx.av, ACTOR_GUEST, h, h, notify, mode);
     }
 
-    // Blinks in place for ninety ticks before the next wander
+    // Picks a hungry, need praise or blink pose for ninety ticks before the guest's next wander
     fn guest_idle<H: Host>(&mut self, ctx: &mut Ctx<H>) {
+        let mut roll = ctx.rand_range(0, 4);
+        if self.guest_state == GS_RUN_TO_FEEDER || self.guest_state == GS_RUN_TO_PILE {
+            roll = 3;
+        }
         self.guest_state = GS_IDLE;
         ctx.actors.walk_to(&ctx.av, ACTOR_GUEST, NO_TARGET);
         ctx.actors.set_timer(ACTOR_GUEST, 0x5a);
-        self.set_guest_anim(ctx, G_BLINK, false, STATE_RESTART_FORWARD);
+        let (food, happiness) = ctx.session.guest().map_or((1, 1), |g| (g.food, g.happiness));
+        if roll == 0 && food == 0 {
+            self.set_guest_anim(ctx, G_HUNGRY, false, STATE_RESTART_FORWARD);
+            ctx.av.play_sfx(self.sfx_guest_hungry, -1);
+            self.nag_hungry(ctx);
+        } else if roll == 1 && happiness == 0 {
+            self.set_guest_anim(ctx, G_NEED_PRAISE, false, STATE_RESTART_FORWARD);
+            ctx.av.play_sfx(self.sfx_guest_sad, -1);
+            self.nag_praise(ctx);
+        } else {
+            self.set_guest_anim(ctx, G_BLINK, false, STATE_RESTART_FORWARD);
+        }
         ctx.actors.face(&ctx.av, ACTOR_GUEST, FACING_NONE);
+    }
+
+    // Counts a hungry pose and has the caster nag after four while the hands are free
+    fn nag_hungry<H: Host>(&mut self, ctx: &mut Ctx<H>) {
+        self.hungry_nags += 1;
+        if self.hungry_nags > 3 && ctx.cursor.visible {
+            self.caster_speak(ctx, "008.wav");
+            self.hungry_nags = 0;
+        }
+    }
+
+    // Counts a sad pose and has the caster nag after four while the hands are free
+    fn nag_praise<H: Host>(&mut self, ctx: &mut Ctx<H>) {
+        self.praise_nags += 1;
+        if self.praise_nags > 3 && ctx.cursor.visible {
+            self.caster_speak(ctx, "007.wav");
+            self.praise_nags = 0;
+        }
+    }
+
+    // Sends the guest running to an x at the dash speed with no wander timer
+    fn guest_run_to<H: Host>(&mut self, ctx: &mut Ctx<H>, target: i32, state: u32) {
+        let right = self.guest_anims[G_RUN_RIGHT];
+        let left = self.guest_anims[G_RUN_LEFT];
+        ctx.actors.set_anims(&ctx.av, ACTOR_GUEST, right, left, false, STATE_RESTART_FORWARD);
+        ctx.actors.set_y(ACTOR_GUEST, GROUND_Y + GUEST_DY);
+        ctx.actors.walk_to(&ctx.av, ACTOR_GUEST, target);
+        ctx.actors.set_arc(ACTOR_GUEST, 12.0, 8.0);
+        ctx.actors.set_timer(ACTOR_GUEST, 0);
+        self.guest_state = state;
+    }
+
+    // Parks the guest blinking with no target and no wander timer, keeping its state
+    fn guest_wait<H: Host>(&mut self, ctx: &mut Ctx<H>) {
+        self.set_guest_anim(ctx, G_BLINK, false, STATE_RESTART_FORWARD);
+        ctx.actors.walk_to(&ctx.av, ACTOR_GUEST, NO_TARGET);
+        ctx.actors.face(&ctx.av, ACTOR_GUEST, FACING_NONE);
+        ctx.actors.set_timer(ACTOR_GUEST, 0);
+    }
+
+    // Refuses with the hungry pose when the guest's own food is gone, true when it refused
+    fn guest_refuses_hungry<H: Host>(&mut self, ctx: &mut Ctx<H>) -> bool {
+        if ctx.session.guest().is_none_or(|g| g.food != 0) {
+            return false;
+        }
+        self.set_guest_anim(ctx, G_HUNGRY, false, STATE_RESTART_FORWARD);
+        ctx.actors.face(&ctx.av, ACTOR_GUEST, FACING_NONE);
+        ctx.actors.walk_to(&ctx.av, ACTOR_GUEST, NO_TARGET);
+        ctx.actors.set_timer(ACTOR_GUEST, 0x5a);
+        self.guest_state = GS_IDLE;
+        ctx.av.play_sfx(self.sfx_guest_hungry, -1);
+        self.nag_hungry(ctx);
+        true
     }
 
     // Parks the visiting crunchling briefly, then it runs out of the door after the resident one
@@ -640,7 +749,7 @@ impl HomeWorldScreen {
         }
     }
 
-    // Turns a wander around at its end and leaves a departing guest on its way
+    // Turns a wander around, eats at the pile, waits at the feeder or closes the door behind a leaver
     fn on_guest_target_reached<H: Host>(&mut self, ctx: &mut Ctx<H>) {
         match self.guest_state {
             GS_WALK_RIGHT => {
@@ -651,8 +760,32 @@ impl HomeWorldScreen {
                 ctx.actors.walk_to(&ctx.av, ACTOR_GUEST, GUEST_WALK_RIGHT_X);
                 self.guest_state = GS_WALK_RIGHT;
             }
-            GS_LEAVING => {}
+            GS_LEAVING => self.close_door_behind(ctx),
+            GS_RUN_TO_FEEDER | GS_SPEECH_RUN => self.guest_wait(ctx),
+            GS_RUN_TO_PILE => {
+                self.set_guest_anim(ctx, G_EAT, false, STATE_RESTART_FORWARD);
+                ctx.actors.face(&ctx.av, ACTOR_GUEST, FACING_FORCE_NONE);
+                self.start_pile_eating(ctx);
+                ctx.actors.walk_to(&ctx.av, ACTOR_GUEST, NO_TARGET);
+                ctx.av.play_sfx(self.sfx_guest_eat, -1);
+            }
             _ => self.guest_idle(ctx),
+        }
+    }
+
+    // Plays the pile being eaten at eight frames a second with an end notice
+    fn start_pile_eating<H: Host>(&mut self, ctx: &mut Ctx<H>) {
+        let pile = self.anim(self.pile_index);
+        ctx.actors.set_anims(&ctx.av, ACTOR_PILE, pile, pile, true, STATE_RESTART_FORWARD);
+        ctx.actors.set_fps(ACTOR_PILE, 8);
+    }
+
+    // Closes the door once every crunchling bound for a game has run out of it
+    fn close_door_behind<H: Host>(&mut self, ctx: &mut Ctx<H>) {
+        let resident_out = ctx.actors.pos(ACTOR_CRUNCHLING).0 <= EXIT_X as f32;
+        let guest_out = ctx.actors.find(ACTOR_GUEST).is_none_or(|_| ctx.actors.pos(ACTOR_GUEST).0 <= EXIT_X as f32);
+        if resident_out && guest_out {
+            self.set_door(ctx, false);
         }
     }
 
@@ -676,6 +809,7 @@ impl HomeWorldScreen {
                 self.set_guest_anim(ctx, G_QTIP_THROW, true, STATE_RESTART_FORWARD);
                 self.guest_state = GS_QTIP_THROW;
             }
+            GS_RUN_TO_PILE | GS_RUN_TO_FEEDER | GS_LEAVING | GS_SPEECH_RUN => {}
             _ => self.guest_idle(ctx),
         }
     }
@@ -691,7 +825,17 @@ impl HomeWorldScreen {
             return;
         }
         let tool = pick_tool(guest, my - GUEST_DY as i32, false);
-        let busy = matches!(self.guest_state, GS_PLAYING | GS_QTIP_OUT | GS_QTIP_EAR_LOOP | GS_QTIP_DISGUST | GS_LEAVING);
+        let busy = matches!(
+            self.guest_state,
+            GS_PLAYING
+                | GS_QTIP_OUT
+                | GS_QTIP_EAR_LOOP
+                | GS_QTIP_DISGUST
+                | GS_LEAVING
+                | GS_RUN_TO_FEEDER
+                | GS_RUN_TO_PILE
+                | GS_SPEECH_RUN
+        );
         if down && !busy {
             ctx.actors.walk_to(&ctx.av, ACTOR_GUEST, NO_TARGET);
             ctx.actors.set_timer(ACTOR_GUEST, 0);
@@ -887,10 +1031,13 @@ impl HomeWorldScreen {
                     self.set_door(ctx, true);
                     self.set_crunchling_run(ctx);
                     ctx.actors.set_y(ACTOR_CRUNCHLING, GROUND_Y);
-                    ctx.actors.walk_to(&ctx.av, ACTOR_CRUNCHLING, 300);
+                    ctx.actors.walk_to(&ctx.av, ACTOR_CRUNCHLING, SPEECH_X);
                     ctx.actors.set_arc(ACTOR_CRUNCHLING, 12.0, 8.0);
                     ctx.actors.set_timer(ACTOR_CRUNCHLING, 0);
                     self.crunchling_state = CL_SPEECH_RUN;
+                    if ctx.actors.find(ACTOR_GUEST).is_some() {
+                        self.guest_run_to(ctx, GUEST_SPEECH_X, GS_SPEECH_RUN);
+                    }
                     self.capn_step += 1;
                 }
                 1 => {
@@ -974,9 +1121,7 @@ impl HomeWorldScreen {
             OBJ_SPEED => self.capn_sequence = SEQ_SPEED,
             OBJ_STRENGTH => self.capn_sequence = SEQ_STRENGTH,
             OBJ_JUMP => self.capn_sequence = SEQ_JUMP,
-            OBJ_CHALLENGE if ctx.player.stage > 1 || ctx.session.guest().is_some() => {
-                self.capn_sequence = SEQ_CHALLENGE;
-            }
+            OBJ_CHALLENGE if ctx.player.stage > 1 => self.capn_sequence = SEQ_CHALLENGE,
             OBJ_TIPS => {
                 if ctx.player.tips_index == 0 {
                     self.caster_speak(ctx, "014.wav");
@@ -995,17 +1140,20 @@ impl HomeWorldScreen {
             _ => {}
         }
         if self.capn_sequence != SEQ_NONE {
+            let mut refused = false;
             if ctx.player.food == 0 {
                 self.set_crunchling_anim(ctx, ANIM_HUNGRY, false, STATE_RESTART_FORWARD);
                 ctx.actors.face(&ctx.av, ACTOR_CRUNCHLING, FACING_NONE);
                 ctx.actors.walk_to(&ctx.av, ACTOR_CRUNCHLING, NO_TARGET);
                 ctx.actors.set_timer(ACTOR_CRUNCHLING, 0x5a);
                 ctx.av.play_sfx(self.sfx_hungry, -1);
-                self.hungry_nags += 1;
-                if self.hungry_nags > 3 && ctx.cursor.visible {
-                    self.caster_speak(ctx, "008.wav");
-                    self.hungry_nags = 0;
-                }
+                self.nag_hungry(ctx);
+                refused = true;
+            }
+            if ctx.actors.find(ACTOR_GUEST).is_some() && self.guest_refuses_hungry(ctx) {
+                refused = true;
+            }
+            if refused {
                 self.capn_sequence = SEQ_NONE;
             } else {
                 self.capn_step = 0;
@@ -1013,33 +1161,106 @@ impl HomeWorldScreen {
             }
         }
         if fed {
-            ctx.av.play_sfx(self.sfx_lever, -1);
-            if ctx.player.food < 5 {
-                ctx.av.play_sfx(self.sfx_yahoo, -1);
-            }
-            ctx.scene.set_hover_by_id(OBJ_K1, HOVER_HIDDEN);
-            ctx.scene.set_hover_by_id(OBJ_K2, HOVER_HIDDEN);
-            ctx.scene.set_hover_by_id(OBJ_K3, HOVER_HIDDEN);
-            let lid = self.anim(self.box_index);
-            ctx.actors.set_anims(&ctx.av, ACTOR_BOX, lid, lid, true, STATE_RESTART_FORWARD);
-            self.box_opening = true;
-            ctx.actors.set_visible(ACTOR_PILE, false);
-            ctx.actors.set_y(ACTOR_CRUNCHLING, GROUND_Y);
-            if ctx.player.food < 5 {
-                self.set_crunchling_run(ctx);
-                ctx.actors.walk_to(&ctx.av, ACTOR_CRUNCHLING, 400);
-                ctx.actors.set_arc(ACTOR_CRUNCHLING, 12.0, 8.0);
-                ctx.actors.set_timer(ACTOR_CRUNCHLING, 0);
-                self.crunchling_state = CL_RUN_TO_FEEDER;
-            } else {
-                ctx.actors.walk_to(&ctx.av, ACTOR_CRUNCHLING, NO_TARGET);
-                ctx.actors.set_timer(ACTOR_CRUNCHLING, 0);
-                self.set_crunchling_anim(ctx, ANIM_NO_FOOD, true, STATE_RESTART_FORWARD);
-                ctx.actors.face(&ctx.av, ACTOR_CRUNCHLING, FACING_NONE);
-            }
-            ctx.cursor.set_visible(false);
+            self.start_feeding(ctx, Eater::of(who));
         }
         result
+    }
+
+    // Food level of the crunchling a lever is feeding
+    fn eater_food<H: Host>(&self, ctx: &Ctx<H>) -> i16 {
+        match self.eater {
+            Eater::Resident => ctx.player.food,
+            Eater::Guest => ctx.session.guest().map_or(0, |g| g.food),
+        }
+    }
+
+    // Opens the box and sends the lever puller's crunchling to the feeder, or has it refuse when full
+    fn start_feeding<H: Host>(&mut self, ctx: &mut Ctx<H>, eater: Eater) {
+        self.eater = eater;
+        let food = self.eater_food(ctx);
+        ctx.av.play_sfx(self.sfx_lever, -1);
+        if food < 5 {
+            ctx.av.play_sfx(self.sfx_yahoo, -1);
+        }
+        ctx.scene.set_hover_by_id(OBJ_K1, HOVER_HIDDEN);
+        ctx.scene.set_hover_by_id(OBJ_K2, HOVER_HIDDEN);
+        ctx.scene.set_hover_by_id(OBJ_K3, HOVER_HIDDEN);
+        let lid = self.anim(self.box_index);
+        ctx.actors.set_anims(&ctx.av, ACTOR_BOX, lid, lid, true, STATE_RESTART_FORWARD);
+        self.box_opening = true;
+        ctx.actors.set_visible(ACTOR_PILE, false);
+        match eater {
+            Eater::Resident => {
+                ctx.actors.set_y(ACTOR_CRUNCHLING, GROUND_Y);
+                if food < 5 {
+                    self.set_crunchling_run(ctx);
+                    ctx.actors.walk_to(&ctx.av, ACTOR_CRUNCHLING, FEEDER_X);
+                    ctx.actors.set_arc(ACTOR_CRUNCHLING, 12.0, 8.0);
+                    ctx.actors.set_timer(ACTOR_CRUNCHLING, 0);
+                    self.crunchling_state = CL_RUN_TO_FEEDER;
+                } else {
+                    ctx.actors.walk_to(&ctx.av, ACTOR_CRUNCHLING, NO_TARGET);
+                    ctx.actors.set_timer(ACTOR_CRUNCHLING, 0);
+                    self.set_crunchling_anim(ctx, ANIM_NO_FOOD, true, STATE_RESTART_FORWARD);
+                    ctx.actors.face(&ctx.av, ACTOR_CRUNCHLING, FACING_NONE);
+                }
+            }
+            Eater::Guest => {
+                if food < 5 {
+                    self.guest_run_to(ctx, FEEDER_X, GS_RUN_TO_FEEDER);
+                } else {
+                    ctx.actors.walk_to(&ctx.av, ACTOR_GUEST, NO_TARGET);
+                    ctx.actors.set_timer(ACTOR_GUEST, 0);
+                    self.set_guest_anim(ctx, G_NO_FOOD, true, STATE_RESTART_FORWARD);
+                    ctx.actors.face(&ctx.av, ACTOR_GUEST, FACING_NONE);
+                    self.guest_state = GS_PLAYING;
+                }
+            }
+        }
+        ctx.cursor.set_visible(false);
+    }
+
+    // Feeds one portion to the crunchling at the pile and sends it back to its idle
+    fn finish_eating<H: Host>(&mut self, ctx: &mut Ctx<H>) {
+        match self.eater {
+            Eater::Resident => {
+                if ctx.player.food < 5 {
+                    ctx.player.food += 1;
+                }
+                self.idle(ctx);
+            }
+            Eater::Guest => {
+                if let Some(guest) = ctx.session.guest_mut()
+                    && guest.food < 5
+                {
+                    guest.food += 1;
+                }
+                self.guest_idle(ctx);
+            }
+        }
+    }
+
+    // Sends the crunchling being fed running from the feeder to the pile that just appeared
+    fn run_to_pile<H: Host>(&mut self, ctx: &mut Ctx<H>) {
+        let target = ftol((self.pile_x - PILE_APPROACH) as f64);
+        match self.eater {
+            Eater::Resident => {
+                self.set_crunchling_run(ctx);
+                ctx.actors.walk_to(&ctx.av, ACTOR_CRUNCHLING, target);
+                ctx.actors.set_arc(ACTOR_CRUNCHLING, 12.0, 8.0);
+                ctx.actors.set_timer(ACTOR_CRUNCHLING, 0);
+                self.crunchling_state = CL_RUN_TO_PILE;
+            }
+            Eater::Guest => self.guest_run_to(ctx, target, GS_RUN_TO_PILE),
+        }
+    }
+
+    // True while the crunchling being fed stands at the pile eating
+    fn eater_at_pile(&self) -> bool {
+        match self.eater {
+            Eater::Resident => self.crunchling_state == CL_RUN_TO_PILE,
+            Eater::Guest => self.guest_state == GS_RUN_TO_PILE,
+        }
     }
 
     // Swings the door open on layer 4 or closed on layer 1 with its sound when the state changes
@@ -1059,7 +1280,7 @@ impl HomeWorldScreen {
         }
     }
 
-    // Opens the door, parks the crunchling for twenty ticks before it runs off, and sends the guest after it to a challenge
+    // Opens the door, parks the crunchling for twenty ticks before it runs off, and sends the guest after it
     fn leave_to_game<H: Host>(&mut self, ctx: &mut Ctx<H>, next_state: u32) {
         self.pending_state = next_state;
         self.set_door(ctx, true);
@@ -1070,7 +1291,7 @@ impl HomeWorldScreen {
         ctx.actors.set_timer(ACTOR_CRUNCHLING, 0x14);
         ctx.actors.set_y(ACTOR_CRUNCHLING, GROUND_Y);
         ctx.cursor.set_visible(false);
-        if next_state == STATE_CHALLENGE && ctx.session.guest().is_some() {
+        if ctx.actors.find(ACTOR_GUEST).is_some() {
             self.guest_leave(ctx);
         }
     }
@@ -1082,7 +1303,7 @@ impl HomeWorldScreen {
         self.caster_dir = 1;
         self.set_crunchling_run(ctx);
         ctx.actors.set_y(ACTOR_CRUNCHLING, GROUND_Y);
-        ctx.actors.walk_to(&ctx.av, ACTOR_CRUNCHLING, 300);
+        ctx.actors.walk_to(&ctx.av, ACTOR_CRUNCHLING, SPEECH_X);
         ctx.actors.set_arc(ACTOR_CRUNCHLING, 12.0, 8.0);
         ctx.actors.set_timer(ACTOR_CRUNCHLING, 0);
         self.crunchling_state = CL_SPEECH_RUN;
@@ -1106,9 +1327,7 @@ impl HomeWorldScreen {
                             if target < 0 || target == ftol((self.pile_x - PILE_APPROACH) as f64) {
                                 self.set_crunchling_anim(ctx, ANIM_EAT, false, STATE_RESTART_FORWARD);
                                 ctx.actors.face(&ctx.av, ACTOR_CRUNCHLING, FACING_FORCE_NONE);
-                                let pile = self.anim(self.pile_index);
-                                ctx.actors.set_anims(&ctx.av, ACTOR_PILE, pile, pile, true, STATE_RESTART_FORWARD);
-                                ctx.actors.set_fps(ACTOR_PILE, 8);
+                                self.start_pile_eating(ctx);
                                 ctx.actors.walk_to(&ctx.av, ACTOR_CRUNCHLING, NO_TARGET);
                                 ctx.av.play_sfx(self.sfx_eat, -1);
                             }
@@ -1125,7 +1344,7 @@ impl HomeWorldScreen {
                             ctx.actors.walk_to(&ctx.av, ACTOR_CRUNCHLING, 400);
                             self.crunchling_state = CL_WALK_RIGHT;
                         }
-                        CL_LEAVING => self.set_door(ctx, false),
+                        CL_LEAVING => self.close_door_behind(ctx),
                         CL_SPEECH_RUN => {
                             self.set_crunchling_anim(ctx, ANIM_BLINK, false, STATE_RESTART_FORWARD);
                             ctx.actors.walk_to(&ctx.av, ACTOR_CRUNCHLING, NO_TARGET);
@@ -1360,25 +1579,18 @@ impl HomeWorldScreen {
             ACTOR_CAPN => self.capn_sequence_step(ctx).await,
             ACTOR_TUBE => ctx.actors.set_visible(ACTOR_TUBE, false),
             ACTOR_PILE => {
-                if self.crunchling_state == CL_RUN_TO_PILE {
-                    if ctx.player.food < 5 {
-                        ctx.player.food += 1;
-                    }
-                    self.idle(ctx);
+                if self.eater_at_pile() {
+                    self.finish_eating(ctx);
                     ctx.actors.set_visible(ACTOR_PILE, false);
                     let lid = self.anim(self.box_index);
                     ctx.actors.set_anims(&ctx.av, ACTOR_BOX, lid, lid, true, STATE_RESTART_BACKWARD);
                 } else {
-                    self.set_crunchling_run(ctx);
-                    ctx.actors.walk_to(&ctx.av, ACTOR_CRUNCHLING, ftol((self.pile_x - PILE_APPROACH) as f64));
-                    ctx.actors.set_arc(ACTOR_CRUNCHLING, 12.0, 8.0);
-                    ctx.actors.set_timer(ACTOR_CRUNCHLING, 0);
-                    self.crunchling_state = CL_RUN_TO_PILE;
+                    self.run_to_pile(ctx);
                 }
             }
             ACTOR_BOX => {
                 if self.box_opening {
-                    if ctx.player.food < 5 {
+                    if self.eater_food(ctx) < 5 {
                         ctx.actors.set_timer(ACTOR_TUBE, 0xf);
                         let tube = self.anim(self.tube_index);
                         ctx.actors.set_anims(&ctx.av, ACTOR_TUBE, tube, tube, true, STATE_RESTART_FORWARD);
@@ -1470,19 +1682,11 @@ impl HomeWorldScreen {
         if roll == 0 && ctx.player.food == 0 {
             self.set_crunchling_anim(ctx, ANIM_HUNGRY, false, STATE_RESTART_FORWARD);
             ctx.av.play_sfx(self.sfx_hungry, -1);
-            self.hungry_nags += 1;
-            if self.hungry_nags > 3 && ctx.cursor.visible {
-                self.caster_speak(ctx, "008.wav");
-                self.hungry_nags = 0;
-            }
+            self.nag_hungry(ctx);
         } else if roll == 1 && ctx.player.happiness == 0 {
             self.set_crunchling_anim(ctx, ANIM_NEED_PRAISE, false, STATE_RESTART_FORWARD);
             ctx.av.play_sfx(self.sfx_sad, -1);
-            self.praise_nags += 1;
-            if self.praise_nags > 3 && ctx.cursor.visible {
-                self.caster_speak(ctx, "007.wav");
-                self.praise_nags = 0;
-            }
+            self.nag_praise(ctx);
         } else {
             self.set_crunchling_anim(ctx, ANIM_BLINK, false, STATE_RESTART_FORWARD);
         }
@@ -1554,7 +1758,7 @@ impl HomeWorldScreen {
                 self.caster_y -= CASTER_STEP;
             }
         } else if CASTER_SHOWN_Y <= self.caster_y {
-            if ctx.av.is_key_down(KEY_SPACE) || ctx.helper_key_down(KEY_SPACE) || ctx.stream_done(self.voice_channel) {
+            if ctx.either_key_down(KEY_SPACE) || ctx.stream_done(self.voice_channel) {
                 ctx.av.kill_streaming_channel(self.voice_channel);
                 ctx.cursor.set_visible(true);
                 self.idle(ctx);
@@ -1615,7 +1819,7 @@ impl<H: Host> Screen<H> for HomeWorldScreen {
         ctx.scene.set_hover_by_id(OBJ_FEEDER_GLOW, HOVER_HIDDEN);
         ctx.scene.set_hover_by_id(OBJ_CASTER_GLOW, HOVER_HIDDEN);
         let guest = ctx.session.guest().cloned();
-        if ctx.player.stage < 2 && guest.is_none() {
+        if ctx.player.stage < 2 {
             ctx.scene.set_hover_by_id(OBJ_CHALLENGE, HOVER_PRESSED);
         }
         let name = ctx.player.name_str();
@@ -1671,7 +1875,6 @@ impl<H: Host> Screen<H> for HomeWorldScreen {
         ctx.cursor.set_anim(&ctx.av, self.anim(ANIM_MOUSE));
         ctx.cursor.set_visible(true);
         ctx.cursor.set_pos(0x140, 200);
-        self.helper_cursor.set_anim(&ctx.av, self.anim(ANIM_MOUSE_ONLINE));
         self.helper_latched = false;
         if self.capn_sequence != SEQ_TRANSFORMED {
             self.crunchling_state = CL_IDLE;
@@ -1698,6 +1901,7 @@ impl<H: Host> Screen<H> for HomeWorldScreen {
         ctx.player.challenge_active = 0;
         self.hungry_nags = 0;
         self.praise_nags = 0;
+        self.eater = Eater::Resident;
         true
     }
 
@@ -1750,7 +1954,6 @@ impl<H: Host> Screen<H> for HomeWorldScreen {
         }
         ctx.cursor.set_anim(&ctx.av, self.anim(self.cursor_index));
         let helper_art = if self.helper_cursor_index == ANIM_MOUSE { ANIM_MOUSE_ONLINE } else { self.helper_cursor_index };
-        self.helper_cursor.set_anim(&ctx.av, self.anim(helper_art));
         ctx.session.helper_art = self.anim(helper_art);
         ctx.actors.draw(&mut ctx.av, &ctx.scene, 2);
         ctx.scene.draw_layer(&mut ctx.av, 2);
@@ -1775,11 +1978,6 @@ impl<H: Host> Screen<H> for HomeWorldScreen {
             self.capn_sequence_step(ctx).await;
         }
         ctx.cursor.draw(&mut ctx.av);
-        if ctx.cursor.visible && ctx.session.helper_present() && !ctx.session.local_is_helper() {
-            self.helper_cursor.set_pos(ctx.session.helper.x, ctx.session.helper.y);
-            self.helper_cursor.set_visible(true);
-            self.helper_cursor.draw(&mut ctx.av);
-        }
         ctx.scene.advance_anims(&ctx.av);
         if self.result != RESULT_CONTINUE {
             result = self.result;

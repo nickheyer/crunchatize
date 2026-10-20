@@ -232,6 +232,26 @@ impl PlayerData {
         }
     }
 
+    // Pays for one training game, food and happiness spent when going home, the stat raised twice with a berry bonus
+    pub fn train(&mut self, stat: i32, bonus: bool, going_home: bool) {
+        if going_home {
+            if self.food != 0 {
+                self.food = self.food.wrapping_sub(1);
+            }
+            if self.happiness != 0 {
+                self.happiness = self.happiness.wrapping_sub(1);
+            }
+        }
+        let steps = if bonus { 2 } else { 1 };
+        for _ in 0..steps {
+            match stat {
+                STAT_RUNNING => self.add_stats(1, 0, 0),
+                STAT_STRENGTH => self.add_stats(0, 1, 0),
+                _ => self.add_stats(0, 0, 1),
+            }
+        }
+    }
+
     // Recolours the two skin and fur ramps of a palette from black toward the chosen colours
     pub fn recolor_palette(&self, pal: &mut Palette24) {
         palette_gradient(pal, 1, 0x50, [0, 0, 0], self.flesh);
@@ -358,6 +378,17 @@ mod tests {
         p.jumping = 7;
         p.add_stats(0, 0, 0);
         assert_eq!((p.stage, p.transform_pending), (1, 1));
+    }
+
+    #[test]
+    fn training_pays_the_stat_and_spends_only_on_the_way_home() {
+        let mut p = PlayerData { food: 3, happiness: 0, ..Default::default() };
+        p.train(STAT_RUNNING, true, true);
+        assert_eq!((p.food, p.happiness, p.running), (2, 0, 2));
+        p.train(STAT_STRENGTH, false, false);
+        assert_eq!((p.food, p.strength), (2, 1));
+        p.train(STAT_JUMPING, false, true);
+        assert_eq!((p.food, p.jumping), (1, 1));
     }
 
     #[test]

@@ -11,10 +11,16 @@ pub fn wins_text(name: &str) -> String {
     format!("{name} WINS!")
 }
 
+// Banner text for a friend match that ended level
+pub fn tie_text() -> &'static str {
+    "TIE!"
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
     fn banner_names_the_winner() {
         assert_eq!(super::wins_text("MATE"), "MATE WINS!");
+        assert_eq!(super::tie_text(), "TIE!");
     }
 }

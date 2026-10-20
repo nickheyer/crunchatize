@@ -104,12 +104,13 @@ impl ScreenBox {
     }
 }
 
-// The state machine that owns the current screen, the Go Online box and the helper's own hand
+// The state machine that owns the current screen, the Go Online box and the two online hands
 pub struct Game {
     pub state: u32,
     pub screen: Option<ScreenBox>,
     pub dialog: Option<Dialog>,
     hand: Cursor,
+    friend_hand: Cursor,
 }
 
 impl Default for Game {
@@ -120,7 +121,7 @@ impl Default for Game {
 
 impl Game {
     pub fn new() -> Self {
-        Self { state: STATE_BOOT, screen: None, dialog: None, hand: Cursor::default() }
+        Self { state: STATE_BOOT, screen: None, dialog: None, hand: Cursor::default(), friend_hand: Cursor::default() }
     }
 
     pub fn destroy_screen<H: Host>(&mut self, ctx: &mut Ctx<H>) {
@@ -149,6 +150,7 @@ impl Game {
     pub async fn switch_state<H: Host>(&mut self, ctx: &mut Ctx<H>, state: u32) -> bool {
         self.dialog = None;
         self.hand.anim.anim = NO_HANDLE;
+        self.friend_hand.anim.anim = NO_HANDLE;
         ctx.session.on_switched();
         if self.screen.is_some() {
             self.destroy_screen(ctx);
@@ -243,24 +245,32 @@ impl Game {
         }
     }
 
-    // Draws the box, or the helper's own immediate hand on the machine that plays the helper
+    // Picks a hand's art, the screen's chosen tool or the online hat, false while neither is loaded
+    async fn dress_hand<H: Host>(hand: &mut Cursor, ctx: &mut Ctx<H>) -> bool {
+        let art = ctx.session.helper_art;
+        if art != NO_HANDLE {
+            hand.set_anim(&ctx.av, art);
+        } else if hand.anim.anim == NO_HANDLE
+            && let Some(h) = ctx.av.get_anim(&mut ctx.host, HELPER_HAND_ART).await
+        {
+            hand.set_anim(&ctx.av, h);
+        }
+        hand.anim.anim != NO_HANDLE
+    }
+
+    // Draws the friend's hand on the host, then the box, or the helper's own immediate hand on the helper's machine
     async fn draw_overlay<H: Host>(&mut self, ctx: &mut Ctx<H>) {
+        let hands_shown = ctx.cursor.visible && ctx.session.helper_present();
+        if hands_shown && !ctx.session.local_is_helper() && Self::dress_hand(&mut self.friend_hand, ctx).await {
+            self.friend_hand.set_pos(ctx.session.helper.x, ctx.session.helper.y);
+            self.friend_hand.set_visible(true);
+            self.friend_hand.draw(&mut ctx.av);
+        }
         if let Some(dialog) = self.dialog.as_mut() {
             dialog.draw(ctx);
             return;
         }
-        if !ctx.session.local_is_helper() {
-            return;
-        }
-        let art = ctx.session.helper_art;
-        if art != NO_HANDLE {
-            self.hand.set_anim(&ctx.av, art);
-        } else if self.hand.anim.anim == NO_HANDLE
-            && let Some(h) = ctx.av.get_anim(&mut ctx.host, HELPER_HAND_ART).await
-        {
-            self.hand.set_anim(&ctx.av, h);
-        }
-        if self.hand.anim.anim == NO_HANDLE {
+        if !hands_shown || !ctx.session.local_is_helper() || !Self::dress_hand(&mut self.hand, ctx).await {
             return;
         }
         self.hand.set_pos(ctx.session.local_hand.x, ctx.session.local_hand.y);

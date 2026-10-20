@@ -4,11 +4,11 @@ use avmanager::sound::INVALID_HANDLE;
 
 use crate::actors::{EVENT_ANIM_END, EVENT_GROUND_REACHED, EVENT_INIT_OBJECT, FACING_NONE, NO_HANDLE};
 use crate::ctx::{
-    Ctx, Held, KEY_ESC, KEY_SPACE, MOUSE_LEFT, RESULT_CONTINUE, STATE_CHALLENGE, STATE_HOME_WORLD, STATE_RUNNING,
-    Screen,
+    Ctx, Held, KEY_ESC, KEY_SPACE, RESULT_CONTINUE, STATE_CHALLENGE, STATE_HOME_WORLD, STATE_RUNNING, Screen,
 };
 use crate::host::Host;
 use crate::online::wins_text;
+use crate::player::{PlayerData, STAT_RUNNING};
 use crate::scene::{HOVER_HIDDEN, HOVER_NORMAL, LAYER_ALL};
 use crate::scroll_strip::ScrollStrip;
 use crate::skin::Skin;
@@ -103,13 +103,32 @@ const ACCEL: f32 = 0.6;
 const BRAKE: f32 = 0.7;
 const OBJ_BERRIES: i32 = 1;
 const OBJ_TIME: i32 = 2;
+const OBJ_BEST_TITLE: i32 = 3;
+const OBJ_BEST_TIME: i32 = 4;
+const OBJ_DONE: i32 = 5;
+const OBJ_AGAIN: i32 = 6;
 const OBJ_GOOD_JOB: i32 = 7;
+const OBJ_BERRY_ICON: i32 = 8;
+const OBJ_TIME_TITLE: i32 = 9;
+const OBJ_GUEST_BERRIES: i32 = 10;
+const OBJ_GUEST_ICON: i32 = 11;
+const OBJ_NAME: i32 = 12;
+const OBJ_GUEST_NAME: i32 = 13;
+const BONUS_BERRIES: u32 = 4;
+
+// Friend match counters, each skater's berry icon and count on the clock row under its name
+const NAME_Y: i32 = 14;
+const COUNT_Y: i32 = 50;
+const ICON_Y: i32 = 65;
+const RESIDENT_COUNTER: (i32, i32, i32) = (294, 319, 337);
+const GUEST_COUNTER: (i32, i32, i32) = (394, 419, 437);
 
 // Friend match camera, the midpoint of both skaters drawn here and a lead this long ending the race
 const VERSUS_CENTER: f32 = 280.0;
 const VERSUS_GAP_LIMIT: f32 = 520.0;
 const VERSUS_SPAWN_X: f32 = 900.0;
 const VERSUS_RIVAL_DEPTH: f32 = 8.0;
+const LANE_STAGGER: f32 = 25.0;
 const LINE_SCREEN_X: f32 = 700.0;
 const CROSS_PAST: f32 = 60.0;
 
@@ -152,6 +171,17 @@ struct Skater {
     platform_jumps: u32,
     ride_shift: f32,
     ground_y: f32,
+}
+
+// Stores a race time as a crunchling's best when it beats the one on record
+fn record_best(player: &mut PlayerData, seconds: u16, fraction: f32) {
+    let hundredths = (ftol(f64::from(fraction)) * 5) as i16;
+    if seconds < player.run_best_secs
+        || (player.run_best_secs == seconds && f64::from(fraction) * 5.0 < f64::from(player.run_best_frac as u16))
+    {
+        player.run_best_secs = seconds;
+        player.run_best_frac = hundredths;
+    }
 }
 
 impl Skater {
@@ -207,9 +237,9 @@ fn time_text(seconds: u16, hundredths: i32) -> String {
     format!(" {seconds}.{hundredths:02}")
 }
 
-// Screen x of a skater in a friend match, half the lead over the other away from the camera centre
-fn versus_screen_x(pos: f32, other: f32) -> f32 {
-    VERSUS_CENTER + (pos - other) / 2.0
+// Screen x of a friend match skater, half its lead from the centre held at the deciding gap, plus its lane
+fn versus_screen_x(pos: f32, other: f32, lane: f32) -> f32 {
+    VERSUS_CENTER + (pos - other).clamp(-VERSUS_GAP_LIMIT, VERSUS_GAP_LIMIT) / 2.0 + lane
 }
 
 // Who a lead too long for one screen hands the race to, None while both are still in frame
@@ -331,30 +361,39 @@ impl RunningScreen {
         Some(skater)
     }
 
-    // Rewards the running stat for done or Again and picks the next state
+    // Pays every skater's running training for done or Again and picks the next state
     fn on_mouse_hit<H: Host>(&self, ctx: &mut Ctx<H>, id: i32) -> u32 {
-        let mut result = RESULT_CONTINUE;
-        let berries = self.skaters[0].berries;
-        if id == 5 {
-            if ctx.player.food != 0 {
-                ctx.player.food -= 1;
+        let going_home = match id {
+            OBJ_DONE => true,
+            OBJ_AGAIN => false,
+            _ => return RESULT_CONTINUE,
+        };
+        for skater in &self.skaters {
+            let bonus = BONUS_BERRIES < skater.berries;
+            match (skater.friend, ctx.session.guest_mut()) {
+                (true, Some(guest)) => guest.train(STAT_RUNNING, bonus, going_home),
+                (true, None) => {}
+                (false, _) => ctx.player.train(STAT_RUNNING, bonus, going_home),
             }
-            if ctx.player.happiness != 0 {
-                ctx.player.happiness -= 1;
-            }
-            ctx.player.add_stats(1, 0, 0);
-            if 4 < berries {
-                ctx.player.add_stats(1, 0, 0);
-            }
-            result = STATE_HOME_WORLD;
-        } else if id == 6 {
-            ctx.player.add_stats(1, 0, 0);
-            if 4 < berries {
-                ctx.player.add_stats(1, 0, 0);
-            }
-            result = STATE_RUNNING;
         }
-        result
+        if going_home { STATE_HOME_WORLD } else { STATE_RUNNING }
+    }
+
+    // Lays the friend match counters out, each skater's berries on the clock row under its name
+    fn layout_counters<H: Host>(ctx: &mut Ctx<H>) {
+        let (icon_x, count_x, name_x) = RESIDENT_COUNTER;
+        ctx.scene.move_object(&ctx.av, OBJ_BERRY_ICON, icon_x, ICON_Y);
+        ctx.scene.move_object(&ctx.av, OBJ_BERRIES, count_x, COUNT_Y);
+        let (icon_x, count_x, guest_name_x) = GUEST_COUNTER;
+        ctx.scene.clone_object(&ctx.av, OBJ_BERRY_ICON, OBJ_GUEST_ICON, icon_x, ICON_Y, 0);
+        ctx.scene.clone_object(&ctx.av, OBJ_BERRIES, OBJ_GUEST_BERRIES, count_x, COUNT_Y, 0);
+        ctx.scene.clone_object(&ctx.av, OBJ_TIME_TITLE, OBJ_NAME, name_x, NAME_Y, 1);
+        ctx.scene.clone_object(&ctx.av, OBJ_TIME_TITLE, OBJ_GUEST_NAME, guest_name_x, NAME_Y, 1);
+        let name = ctx.player.name_str();
+        ctx.scene.set_text_by_id(OBJ_NAME, &name);
+        let guest = ctx.session.guest_name();
+        ctx.scene.set_text_by_id(OBJ_GUEST_NAME, &guest);
+        ctx.scene.set_text_by_id(OBJ_GUEST_BERRIES, "0");
     }
 
     // Dispatches INIT_OBJECT and ANIM_END and lands a skater on GROUND_REACHED
@@ -466,8 +505,8 @@ impl RunningScreen {
     fn place_skaters<H: Host>(&mut self, ctx: &mut Ctx<H>) {
         if self.versus() {
             let (p0, p1) = (self.skaters[0].pos, self.skaters[1].pos);
-            ctx.actors.set_x(self.skaters[0].actor, versus_screen_x(p0, p1));
-            ctx.actors.set_x(self.skaters[1].actor, versus_screen_x(p1, p0));
+            ctx.actors.set_x(self.skaters[0].actor, versus_screen_x(p0, p1, -LANE_STAGGER));
+            ctx.actors.set_x(self.skaters[1].actor, versus_screen_x(p1, p0, LANE_STAGGER));
         } else {
             let speed = self.skaters[0].speed;
             ctx.actors.set_x(ACTOR_PLAYER, (f64::from(speed) * 6.0 + 50.0) as f32);
@@ -588,9 +627,8 @@ impl RunningScreen {
                 ctx.av.play_sfx(s[SFX_BERRY], -1);
                 ctx.actors.set_visible(slot.actor_id, false);
                 self.skaters[i].berries += 1;
-                if i == 0 {
-                    ctx.scene.set_text_by_id(OBJ_BERRIES, &self.skaters[0].berries.to_string());
-                }
+                let counter = if self.skaters[i].friend { OBJ_GUEST_BERRIES } else { OBJ_BERRIES };
+                ctx.scene.set_text_by_id(counter, &self.skaters[i].berries.to_string());
             } else if first && slot.kind == KIND_FINISH {
                 apply_alt = false;
             } else if first {
@@ -674,19 +712,13 @@ impl RunningScreen {
             ctx.actors.set_layer_mask(ACTOR_OPPONENT, LAYER_MAIN);
             if self.challenge == 0 {
                 self.commentator = COMM_END_DRIVE_IN;
-                let best_frac = ctx.player.run_best_frac as u16;
-                let previous_best = time_text(ctx.player.run_best_secs, i32::from(best_frac));
-                if self.seconds < ctx.player.run_best_secs
-                    || (ctx.player.run_best_secs == self.seconds && f64::from(self.fraction) * 5.0 < f64::from(best_frac))
-                {
-                    ctx.player.run_best_secs = self.seconds;
-                    ctx.player.run_best_frac = (ftol(f64::from(self.fraction)) * 5) as i16;
-                }
-                ctx.scene.set_text_by_id(4, &previous_best);
-                ctx.scene.set_hover_by_id(3, HOVER_NORMAL);
-                ctx.scene.set_hover_by_id(4, HOVER_NORMAL);
-                ctx.scene.set_hover_by_id(5, HOVER_NORMAL);
-                ctx.scene.set_hover_by_id(6, HOVER_NORMAL);
+                let previous_best = time_text(ctx.player.run_best_secs, i32::from(ctx.player.run_best_frac as u16));
+                record_best(&mut ctx.player, self.seconds, self.fraction);
+                ctx.scene.set_text_by_id(OBJ_BEST_TIME, &previous_best);
+                ctx.scene.set_hover_by_id(OBJ_BEST_TITLE, HOVER_NORMAL);
+                ctx.scene.set_hover_by_id(OBJ_BEST_TIME, HOVER_NORMAL);
+                ctx.scene.set_hover_by_id(OBJ_DONE, HOVER_NORMAL);
+                ctx.scene.set_hover_by_id(OBJ_AGAIN, HOVER_NORMAL);
                 ctx.cursor.set_visible(true);
             }
         }
@@ -697,9 +729,11 @@ impl RunningScreen {
     fn versus_race<H: Host>(&mut self, ctx: &mut Ctx<H>) {
         if self.winner.is_none() {
             let (p0, p1) = (self.skaters[0].pos, self.skaters[1].pos);
+            let mut crossed_line = false;
             if let Some(line) = self.line_pos {
                 let crossed: Vec<usize> = (0..2).filter(|&i| self.skaters[i].pos >= line + CROSS_PAST).collect();
                 self.winner = crossed.into_iter().max_by(|&x, &y| self.skaters[x].pos.total_cmp(&self.skaters[y].pos));
+                crossed_line = self.winner.is_some();
             }
             if self.winner.is_none() {
                 self.winner = left_behind(p0 - p1);
@@ -710,6 +744,18 @@ impl RunningScreen {
                 ctx.scene.set_text_by_id(OBJ_GOOD_JOB, &wins_text(&name));
                 ctx.scene.set_hover_by_id(OBJ_GOOD_JOB, HOVER_NORMAL);
                 self.reset_capn(ctx);
+                if self.challenge == 0 {
+                    if crossed_line {
+                        match (w, ctx.session.guest_mut()) {
+                            (1, Some(guest)) => record_best(guest, self.seconds, self.fraction),
+                            (1, None) => {}
+                            _ => record_best(&mut ctx.player, self.seconds, self.fraction),
+                        }
+                    }
+                    ctx.scene.set_hover_by_id(OBJ_DONE, HOVER_NORMAL);
+                    ctx.scene.set_hover_by_id(OBJ_AGAIN, HOVER_NORMAL);
+                    ctx.cursor.set_visible(true);
+                }
             }
         }
         if let Some(w) = self.winner {
@@ -734,25 +780,30 @@ impl<H: Host> Screen<H> for RunningScreen {
     // Loads Running.wam, the strips, actors, anims, sounds and obstacle slots for the variant
     async fn init(&mut self, ctx: &mut Ctx<H>) -> bool {
         self.challenge = i32::from(ctx.player.challenge_active);
-        let guest = ctx.session.guest().filter(|_| self.challenge != 0).cloned();
+        let guest = ctx.session.guest().cloned();
         ctx.scene.load(&mut ctx.av, &mut ctx.host, "Running").await;
         ctx.scene.assign_id("berries", OBJ_BERRIES);
         ctx.scene.assign_id("time", OBJ_TIME);
-        ctx.scene.assign_id("BestTitle", 3);
-        ctx.scene.assign_id("BestTime", 4);
-        ctx.scene.assign_id("done", 5);
-        ctx.scene.assign_id("Again", 6);
+        ctx.scene.assign_id("BestTitle", OBJ_BEST_TITLE);
+        ctx.scene.assign_id("BestTime", OBJ_BEST_TIME);
+        ctx.scene.assign_id("done", OBJ_DONE);
+        ctx.scene.assign_id("Again", OBJ_AGAIN);
+        ctx.scene.assign_id("berry", OBJ_BERRY_ICON);
+        ctx.scene.assign_id("new", OBJ_TIME_TITLE);
         ctx.scene.set_text_by_id(OBJ_TIME, "0.00");
         ctx.scene.set_text_by_id(OBJ_BERRIES, "0");
-        ctx.scene.set_text_by_id(4, "0.00");
-        ctx.scene.set_hover_by_id(3, HOVER_HIDDEN);
-        ctx.scene.set_hover_by_id(4, HOVER_HIDDEN);
-        ctx.scene.set_hover_by_id(5, HOVER_HIDDEN);
-        ctx.scene.set_hover_by_id(6, HOVER_HIDDEN);
+        ctx.scene.set_text_by_id(OBJ_BEST_TIME, "0.00");
+        ctx.scene.set_hover_by_id(OBJ_BEST_TITLE, HOVER_HIDDEN);
+        ctx.scene.set_hover_by_id(OBJ_BEST_TIME, HOVER_HIDDEN);
+        ctx.scene.set_hover_by_id(OBJ_DONE, HOVER_HIDDEN);
+        ctx.scene.set_hover_by_id(OBJ_AGAIN, HOVER_HIDDEN);
         ctx.scene.assign_id("GoodJob", OBJ_GOOD_JOB);
         ctx.scene.set_hover_by_id(OBJ_GOOD_JOB, HOVER_HIDDEN);
         if self.challenge != 0 {
             ctx.scene.set_text_by_id(OBJ_GOOD_JOB, "You Win!");
+        }
+        if guest.is_some() {
+            Self::layout_counters(ctx);
         }
         let Some(mouse) = ctx.av.get_anim(&mut ctx.host, "mouse").await else { return false };
         ctx.cursor.set_anim(&ctx.av, mouse);
@@ -891,7 +942,7 @@ impl<H: Host> Screen<H> for RunningScreen {
             self.anims[index] = h;
         }
         if self.challenge == 0 {
-            let variant_anims = [
+            let mut variant_anims = vec![
                 (A_CART, "hot_dog_cart"),
                 (A_BLOCK, "cone"),
                 (A_BLOCK_ANIM, "coneanim"),
@@ -900,11 +951,15 @@ impl<H: Host> Screen<H> for RunningScreen {
                 (A_PLATFORM, "cratesx4"),
                 (A_BARRICADE, "barricade"),
                 (A_BARRICADE_ANIM, "FlashFallAnim"),
-                (A_OPP_RUN, "turtle_running"),
-                (A_OPP_WAIT, "turtle_warmup"),
-                (A_OPP_VICTORY, "turtle_victory"),
-                (A_OPP_LOSE, "turtle_warmup"),
             ];
+            if guest.is_none() {
+                variant_anims.extend([
+                    (A_OPP_RUN, "turtle_running"),
+                    (A_OPP_WAIT, "turtle_warmup"),
+                    (A_OPP_VICTORY, "turtle_victory"),
+                    (A_OPP_LOSE, "turtle_warmup"),
+                ]);
+            }
             for (index, name) in variant_anims {
                 let Some(h) = ctx.av.get_anim(&mut ctx.host, name).await else { return false };
                 self.anims[index] = h;
@@ -968,10 +1023,8 @@ impl<H: Host> Screen<H> for RunningScreen {
         self.timer_resync = true;
         self.countdown = 0x83;
         ctx.cursor.set_visible(false);
-        self.intro_pending = self.challenge == 0;
-        if 0 < ctx.player.running {
-            self.intro_pending = false;
-        }
+        let untrained = ctx.player.running <= 0 || guest.as_ref().is_some_and(|g| g.running <= 0);
+        self.intro_pending = self.challenge == 0 && untrained;
         self.commentator = COMM_DRIVE_IN;
         self.voice = 0;
         self.finish_frames = 0;
@@ -993,10 +1046,7 @@ impl<H: Host> Screen<H> for RunningScreen {
         if ctx.cursor.visible {
             let (dx, dy) = ctx.av.get_mouse_delta();
             ctx.cursor.move_by(dx, dy);
-            let (mx, my) = (ctx.cursor.x, ctx.cursor.y);
-            if let Some(id) = ctx.scene.hit_test(i32::from(mx), i32::from(my))
-                && ctx.av.is_mouse_button_down(MOUSE_LEFT)
-            {
+            if let Some(id) = ctx.pressed_object() {
                 result = self.on_mouse_hit(ctx, id);
             }
         }
@@ -1098,7 +1148,7 @@ impl<H: Host> Screen<H> for RunningScreen {
         match self.commentator {
             COMM_DRIVE_IN => {
                 let (x, _) = ctx.actors.pos(ACTOR_CAPN);
-                if 400.0 <= x || ctx.av.is_key_down(KEY_SPACE) {
+                if 400.0 <= x || ctx.either_key_down(KEY_SPACE) {
                     ctx.actors.set_pos(ACTOR_CAPN, 400.0, 290.0);
                     ctx.actors.set_pos(ACTOR_CAR, 250.0, 350.0);
                     ctx.actors.set_anims_delayed(
@@ -1131,7 +1181,7 @@ impl<H: Host> Screen<H> for RunningScreen {
                     self.commentator = COMM_TV_IDLE;
                 }
             }
-            COMM_INTRO_SPEECH if ctx.stream_done(self.voice) || ctx.av.is_key_down(KEY_SPACE) => {
+            COMM_INTRO_SPEECH if ctx.stream_done(self.voice) || ctx.either_key_down(KEY_SPACE) => {
                 ctx.av.kill_streaming_channel(self.voice);
                 self.commentator = COMM_DRIVE_OUT;
                 self.intro_pending = false;
@@ -1261,7 +1311,7 @@ impl<H: Host> Screen<H> for RunningScreen {
                 ctx.actors.add_y(skater.actor, -skater.ride_shift);
             }
         }
-        if ctx.av.is_key_down(KEY_ESC) {
+        if ctx.either_key_down(KEY_ESC) {
             result = STATE_HOME_WORLD;
         }
         if self.challenge != 0 && self.finished() {
@@ -1328,12 +1378,25 @@ mod tests {
 
     #[test]
     fn friend_match_camera_splits_the_lead() {
-        assert_eq!(versus_screen_x(0.0, 0.0), VERSUS_CENTER);
-        assert_eq!(versus_screen_x(300.0, 100.0), VERSUS_CENTER + 100.0);
-        assert_eq!(versus_screen_x(100.0, 300.0), VERSUS_CENTER - 100.0);
+        assert_eq!(versus_screen_x(0.0, 0.0, 0.0), VERSUS_CENTER);
+        assert_eq!(versus_screen_x(300.0, 100.0, 0.0), VERSUS_CENTER + 100.0);
+        assert_eq!(versus_screen_x(100.0, 300.0, -LANE_STAGGER), VERSUS_CENTER - 100.0 - LANE_STAGGER);
+        assert_eq!(versus_screen_x(2000.0, 0.0, 0.0), VERSUS_CENTER + VERSUS_GAP_LIMIT / 2.0);
+        assert_eq!(versus_screen_x(0.0, 2000.0, LANE_STAGGER), VERSUS_CENTER - VERSUS_GAP_LIMIT / 2.0 + LANE_STAGGER);
         assert_eq!(left_behind(VERSUS_GAP_LIMIT), None);
         assert_eq!(left_behind(VERSUS_GAP_LIMIT + 1.0), Some(0));
         assert_eq!(left_behind(-VERSUS_GAP_LIMIT - 1.0), Some(1));
+    }
+
+    #[test]
+    fn best_time_only_improves() {
+        let mut p = PlayerData { run_best_secs: 20, run_best_frac: 50, ..Default::default() };
+        record_best(&mut p, 21, 0.0);
+        assert_eq!((p.run_best_secs, p.run_best_frac), (20, 50));
+        record_best(&mut p, 20, 9.0);
+        assert_eq!((p.run_best_secs, p.run_best_frac), (20, 45));
+        record_best(&mut p, 3, 1.2);
+        assert_eq!((p.run_best_secs, p.run_best_frac), (3, 5));
     }
 
     #[test]

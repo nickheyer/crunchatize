@@ -91,14 +91,14 @@ impl<H: Host> Ctx<H> {
         self.session.time_ms(self.host.time_ms())
     }
 
-    // True while a challenge pits the resident crunchling against the visiting friend's
-    pub fn versus(&self) -> bool {
-        self.player.challenge_active != 0 && self.session.guest().is_some()
-    }
-
     // True while the friend holds a key, always false without a friend in the world
     pub fn helper_key_down(&self, code: i32) -> bool {
         self.session.helper_present() && self.session.helper_keys.is_key_down(code)
+    }
+
+    // True while either keyboard in the world holds a key
+    pub fn either_key_down(&self, code: i32) -> bool {
+        self.av.is_key_down(code) || self.helper_key_down(code)
     }
 
     // The race keys one side holds, the friend's relayed keyboard or the host's own
@@ -116,6 +116,22 @@ impl<H: Host> Ctx<H> {
                 left: self.av.is_key_down(KEY_LEFT),
             }
         }
+    }
+
+    // Scene object pressed this tick by the player's own cursor or by the visiting friend's hand
+    pub fn pressed_object(&mut self) -> Option<i32> {
+        let (mx, my) = (i32::from(self.cursor.x), i32::from(self.cursor.y));
+        let mut hit = self.scene.hit_test(mx, my).filter(|_| self.av.is_mouse_button_down(MOUSE_LEFT));
+        if self.session.helper_present() {
+            let hand = self.session.helper;
+            if let Some(id) = self.scene.probe(i32::from(hand.x), i32::from(hand.y)) {
+                self.scene.hover_hot_by_id(id);
+                if hand.down && hit.is_none() {
+                    hit = Some(id);
+                }
+            }
+        }
+        hit
     }
 
     // Whether a streamed voice finished, answered from the host's record when replaying

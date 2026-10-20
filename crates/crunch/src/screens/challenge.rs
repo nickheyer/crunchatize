@@ -213,7 +213,7 @@ impl<H: Host> Screen<H> for ChallengeScreen {
             play_video_modal(&mut ctx.av, &mut ctx.host, "Outro.smk").await;
             ret = STATE_HOME_WORLD;
         }
-        if self.dialogue_state == 7 || ctx.av.is_key_down(KEY_SPACE) {
+        if self.dialogue_state == 7 || ctx.either_key_down(KEY_SPACE) {
             if let Some(state) = game_state(self.picked_game) {
                 ret = state;
             }
@@ -279,7 +279,7 @@ impl<H: Host> Screen<H> for ChallengeScreen {
         ctx.scene.draw_layer(&mut ctx.av, 1);
         ctx.cursor.draw(&mut ctx.av);
         ctx.scene.advance_anims(&ctx.av);
-        if ctx.av.is_key_down(KEY_ESC) {
+        if ctx.either_key_down(KEY_ESC) {
             ret = STATE_HOME_WORLD;
         }
         ret
